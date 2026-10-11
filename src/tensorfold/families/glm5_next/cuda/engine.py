@@ -11,11 +11,23 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+CONTROL_FRAME = os.environ.get("TF_GLM_CONTROL_FRAME", "0")
+if CONTROL_FRAME not in ("0", "1"):
+    raise ValueError("TF_GLM_CONTROL_FRAME must be 0 or 1")
+CONTROL_FRAME = CONTROL_FRAME == "1"
+MAIN_PAD = os.environ.get("TF_GLM_MAIN_PAD", "0")
+if MAIN_PAD not in ("0", "1"):
+    raise ValueError("TF_GLM_MAIN_PAD must be 0 or 1")
+MAIN_PAD = MAIN_PAD == "1"
+
 DEFAULT_POLICY = "auto"
 DFLASH_POLICY = "fc5:0.3"             # DFlash2 drafts every round: up to 5 while their probability product holds 0.3
 EXL3_AUTO = DFLASH_POLICY             # what auto runs on an EXL3 checkpoint with the draft model
-GRAPH_ROWS = (1, 2, 3, 4, 5, 6)       # verify windows captured as CUDA graphs
 MAX_ROWS = 8                          # the widest verify window (a pending token and up to 7 drafts)
+ALL_GRAPH_ROWS = os.environ.get("TF_GLM_ALL_GRAPH_ROWS", "0")
+if ALL_GRAPH_ROWS not in ("0", "1"):
+    raise ValueError("TF_GLM_ALL_GRAPH_ROWS must be 0 or 1")
+GRAPH_ROWS = tuple(range(1, MAX_ROWS + 1)) if ALL_GRAPH_ROWS == "1" else (1, 2, 3, 4, 5, 6)
 DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays dense (contexts up to 2,051 tokens)
 # TF_GLM_DRAFT_RING=0: DFlash2's context in a flat buffer of the whole window, not a 2,176-row ring (the same drafts)
 DRAFT_RING = os.environ.get("TF_GLM_DRAFT_RING", "1").strip() != "0"
@@ -25,7 +37,7 @@ def encode_policy(spec: str) -> list[int]:
     """Encode policy kind, maximum drafts, and two parameters in millionths as four integers, with 10 added to kind for DFlash2."""
 
     spec = str(spec).strip()
-    bad = ValueError(f"draft policy {spec!r}: expected auto[:E:EVERY:MARGIN], 0, N, a[:LOW:HIGH], cN:P, or one of "
+    bad = ValueError(f"draft policy {spec!r}: expected auto[:E:EVERY:MARGIN], 0, N, a[:LOW:HIGH], cN:P, tN:P:S, gN:DECAY:COST, or one of "
                      f"these after f (N from 1 to {MAX_ROWS - 1})")
     try:
         if spec == "auto" or spec.startswith("auto:"):
@@ -36,8 +48,23 @@ def encode_policy(spec: str) -> list[int]:
             if explore < 1 or every < 0 or not 0 <= margin < 1:
                 raise bad
             return [4 if len(parts) == 1 else 5, explore, every, int(round(margin * 1e6))]
+        if spec.startswith(("t", "g")):
+            label, av, bv = spec.split(":")
+            most, a, b = int(label[1:]), float(av), float(bv)
+            if not 1 <= most < MAX_ROWS:
+                raise bad
+            ai, bi = int(round(a * 1e6)), int(round(b * 1e6))
+            if label[0] == "t":
+                if not 0 <= ai <= 1000000 or not 1 <= bi <= 8000000:
+                    raise bad
+                return [6, most, ai, bi]
+            if not 0 <= ai < 1000000 or not 1 <= bi <= 4000000:
+                raise bad
+            return [7, most, ai, bi]
         if spec.startswith("f"):
             code = encode_policy(spec[1:])
+            if code[0] in (6, 7):
+                raise bad
             return [code[0] + 10] + code[1:] if code[0] else code
         if spec.startswith("a"):
             parts = spec.split(":")
@@ -52,7 +79,7 @@ def encode_policy(spec: str) -> list[int]:
                 raise bad
             return [3, most, int(round(float(conf) * 1e6)), 0]
         most = int(spec)
-    except ValueError:
+    except (ValueError, OverflowError):
         raise bad from None
     if not 0 <= most < MAX_ROWS:
         raise bad
@@ -62,11 +89,15 @@ def encode_policy(spec: str) -> list[int]:
 def decode_policy(code: list[int]):
     """Decode a serial, MTP, or automatic policy, retaining exploration, sampling, and margin settings."""
 
-    from .decode import DepthPolicy
+    from .decode import DepthPolicy, GainDepthPolicy
 
     kind, most, a, b = code
     if kind in (4, 5):
         return ("auto", most, a, b / 1e6, kind == 5)
+    if kind == 6:
+        return DepthPolicy(most, fixed=True, confidence=a / 1e6, temperature_scale=b / 1e6)
+    if kind == 7:
+        return GainDepthPolicy(most, decay=a / 1e6, marginal_cost=b / 1e6)
     kind %= 10
     if kind == 2:
         return DepthPolicy(min(most, MAX_ROWS - 1), low=a / 1e6, high=b / 1e6)
@@ -84,6 +115,11 @@ def _ints_f64(lo: int, hi: int) -> float:
 
 
 MTP_DEFAULT = "1"                     # TF_GLM_MTP when unset: the MTP head stays beside DFlash2 (auto, 0: left out)
+# A request that outlives this many seconds is treated as a hang: every rank writes its view (bell, round, replays,
+# the stage it is in) to a file under TF_GLM_WATCHDOG_DIR and exits, so a rank that diverged at a collective cannot
+# hold the GPUs forever. 0 (the default) leaves a run unbounded: an experiment harness sets it.
+WATCHDOG_S = float(os.environ.get("TF_GLM_WATCHDOG_S", "0") or 0)
+WATCHDOG_DIR = os.environ.get("TF_GLM_WATCHDOG_DIR", "")
 
 
 def mtp_head(drafter: bool, serial_only: bool, layers: int, value: str | None = None) -> bool:
@@ -98,11 +134,41 @@ def mtp_head(drafter: bool, serial_only: bool, layers: int, value: str | None = 
     return value == "1" and bool(layers)
 
 
-def without_mtp(transform, layers: int):
+def without_mtp(transform, layers: int, full: bool = False):
     """A startup weight transform that leaves out the MTP layer's tensors (``layers.<num_hidden_layers>.``)."""
 
-    prefix = f"model.language_model.layers.{layers}."
+    prefix = f"model.layers.{layers}." if full else f"model.language_model.layers.{layers}."
     return lambda name, info: (0, 0) if name.startswith(prefix) else transform(name, info)
+
+
+
+def kernel_namespace(runtime: str) -> list[int]:
+    """Hash effective kernel options and source/ABI before rank-local weight loading."""
+    from . import decode, forward as fw, graphs, weights53
+    from tensorfold.cuda import sampling as shared_sampling
+
+    digest = hashlib.sha256()
+    here = Path(__file__).parent
+    shared = here.parents[2] / "cuda" / "exl3"
+    files = [here / n for n in ("engine.py", "decode.py", "graphs.py", "forward.py", "latent.py", "segmented.py", "sparse53.py", "glue.py", "multi.py", "weights53.py", "qmm.py", "mtp.py")]
+    files += sorted(p for p in shared.iterdir() if p.suffix in (".cu", ".cuh", ".cpp", ".py"))
+    files += [shared.parent / "sampling.py", here.parents[2] / "engine" / "exact_sampling.py"]
+    # Use the parsed module settings, not an environment that could change after import.
+    settings = (runtime, shared_sampling.AMAX, shared_sampling.UNSORTED, shared_sampling.SINGLETON, fw.EXPERT_TILE, fw.DOWN_COMBINE, fw.INPLACE_GATHER, fw.GROUPED_MODE, fw.ROUTE_MODE,
+                weights53.LINEAR_MODE, weights53.CONCAT_DIRECT, weights53.CONCAT_PAIR,
+                decode.NUCLEUS_FALLBACK, decode.NUCLEUS_INITIAL, decode.BATCH_SAMPLING, graphs.PACKED_CACHE_LIMIT, graphs.SAMPLING_GRAPH, graphs.SAMPLING_CACHE_LIMIT, graphs.GRAPH_MISS_MODE, CONTROL_FRAME, MAIN_PAD, GRAPH_ROWS)
+    digest.update(repr(settings).encode())
+    # A native tuner changes NCCL's selection, not its communication implementation.
+    # Pin configured plugin/config bytes as well as their names across ranks/caches.
+    for key in ("NCCL_TUNER_PLUGIN", "NCCL_TUNER_CONFIG_FILE"):
+        value = os.environ.get(key, "")
+        digest.update(key.encode() + b"\0" + value.encode())
+        path = Path(value) if value else None
+        if path is not None and path.is_file():
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+    for path in files:
+        digest.update(path.name.encode() + b"\0" + path.read_bytes())
+    return list(struct.unpack("<8i", digest.digest()))
 
 
 class GlmEngine:
@@ -110,19 +176,22 @@ class GlmEngine:
 
     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
                  drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None, serial_only: bool = False, comm=None,
-                 prefill_rows: int | None = None, world: int = 2) -> None:
+                 prefill_rows: int | None = None, world: int = 2, parallel: int = 1) -> None:
         """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between two machines (tests)."""
 
         import torch
 
         from tensorfold.cuda.comm import open_comm
         from .decode import Engine
-        from .weights import Config, load
-        from .split import rule
+        from .weights import Config
+        from .split import rule, rule_full
         from tensorfold.cuda.capacity import admit
         from tensorfold.cuda.geometry import (PREFILL_ROWS, dflash2_geometry, dflash2_weights, mla_geometry,
                                               split_weights)
 
+        if not 1 <= int(parallel) <= 4:
+            raise ValueError("GLM --parallel must be in 1..4")
+        self.parallel = int(parallel)
         encode_policy(policy)                           # a bad default fails here, not in the first request
         torch.cuda.set_device(0)
         self.torch = torch
@@ -134,15 +203,27 @@ class GlmEngine:
         self.world = world_ranks
         self.comm.barrier()
         cfg = Config.read(model_dir)
+        # GLM-5.3 (``glm_moe_dsa``) is another architecture: every layer sparse MLA with a rotary key part, plain
+        # residuals, EXL3 on every linear, and no DFlash2 draft model (speculation is MTP only). Its loader and its
+        # split rule differ from Flash's, so the checkpoint decides which pair runs.
+        self.full = bool(getattr(cfg, "full", False))
+        if self.full:                                   # imported here: a Flash model never reads the EXL3 loader
+            from .weights53 import load
+        else:
+            from .weights import load
+        weights_rule = rule_full if self.full else rule
+        if self.full and drafter is not None:
+            raise ValueError("GLM-5.3 (glm_moe_dsa) drafts with its own MTP head: no DFlash2 draft model fits these "
+                             "layers (serve with --drafter none)")
         # Without --context the window stays dense, attending every key without indexer work.
         explicit = context is not None if context_explicit is None else bool(context_explicit)
         from . import LATENT
 
         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
-        weights_estimate = split_weights(rule, self.world)
+        weights_estimate = split_weights(weights_rule, self.world, draft_head=not self.full)
         if not self.mtp_on:
-            weights_estimate = without_mtp(weights_estimate, cfg.layers)
+            weights_estimate = without_mtp(weights_estimate, cfg.layers, self.full)
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
                                    lambda text: mla_geometry(text, self.world, MAX_ROWS, minimum_slots=DENSE_CAPACITY,
                                                              latent=LATENT, mtp=self.mtp_on),
@@ -153,20 +234,24 @@ class GlmEngine:
         capacity = self.capacity_plan["cache_slots"]
         long_context = self.limit > cfg.dense_limit
         # both ranks must run the same calls: refuse to start when they were given different settings
-        prefill_rows = PREFILL_ROWS if prefill_rows is None else int(prefill_rows)
+        prefill_rows = (128 if self.parallel > 1 else PREFILL_ROWS) if prefill_rows is None else int(prefill_rows)
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
-                prefill_rows, int(self.mtp_on), int(DRAFT_RING)]
+                prefill_rows, int(self.mtp_on), int(DRAFT_RING), self.parallel]
+        # Refuse mixed Python/kernel arithmetic revisions before loading any weights.
+        mine += kernel_namespace(torch.__version__)
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
         spare = max(0, min(wanted, plan["budget_bytes"] - plan["total_bytes_estimate"]))
-        both = self._gather_ints(mine + [spare >> 20])
-        if both[0][:-1] != both[1][:-1]:
-            raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
-                               "TF_GLM_LATENT, TF_GLM_MTP, TF_GLM_DRAFT_RING): "
-                               f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
-                               "(or pass --drafter none to both) and give both the same flags")
-        self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
+        ranks = self._gather_ints(mine + [spare >> 20])
+        first = ranks[0][:-1]
+        if any(row[:-1] != first for row in ranks[1:]):
+            raise RuntimeError(f"the {self.world} ranks were started with different settings (draft model, context, "
+                               f"drafts, kernel source/options, TF_GLM_LATENT, TF_GLM_MTP, TF_GLM_DRAFT_RING): rank 0 {first}, "
+                               + ", ".join(f"rank {i} {row[:-1]}" for i, row in enumerate(ranks[1:], 1))
+                               + "; give every rank the same flags, the same context and the same draft model "
+                                 "(or --drafter none on all of them)")
+        self.cache_bytes = min(row[-1] for row in ranks) << 20
         plan["kept_bytes"] = self.cache_bytes
         for key in ("serving_peak_bytes_estimate", "total_bytes_estimate"):
             plan[key] = plan[key] + self.cache_bytes
@@ -210,6 +295,15 @@ class GlmEngine:
         self.cache: list = []
         self.live: list[int] = []
         self.cache_entries = int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8"))
+        self.multi = self.scheduler = None
+        self.concurrent = self.parallel > 1
+        if self.concurrent:
+            from .multi import MultiDecoder
+            from tensorfold.cuda.scheduler import Scheduler
+            self.multi = MultiDecoder(self, max_streams=self.parallel)
+            torch.cuda.synchronize()
+            if rank == 0:
+                self.scheduler = Scheduler(self.multi, max_streams=self.parallel)
 
     def _calibrate(self) -> dict:
         """Per-piece ms for ``drafter_choice.DrafterChoice``: fastest of interleaved passes, equal on both ranks."""
@@ -297,7 +391,7 @@ class GlmEngine:
         self.comm.all_gather(mine, got)
         return [got[i * len(values):(i + 1) * len(values)].tolist() for i in range(world)]
 
-    # the idle doorbell: rank 1 waits for each request on the rendezvous store (no store: no doorbell), not in NCCL
+    # Each follower owns its notification key; an early consumer cannot delete a late rank's bell.
     def _store(self):
         return getattr(self.comm, "store", None)
 
@@ -305,7 +399,8 @@ class GlmEngine:
         store = self._store()
         if store is not None:
             self._bell = getattr(self, "_bell", 0) + 1
-            store.set(f"tf_glm_request_{self._bell}", b"1")
+            for rank in range(1, self.world):
+                store.set(f"tf_glm_request_{self._bell}_{rank}", b"1")
 
     def _await_bell(self) -> None:
         store = self._store()
@@ -313,7 +408,7 @@ class GlmEngine:
             return
         from datetime import timedelta
 
-        key = f"tf_glm_request_{getattr(self, '_bell', 0) + 1}"
+        key = f"tf_glm_request_{getattr(self, '_bell', 0) + 1}_{self.rank}"
         while True:
             try:
                 store.wait([key], timedelta(hours=1))
@@ -342,6 +437,8 @@ class GlmEngine:
     def _effective(self, code: list[int]) -> list[int]:
         """Resolve auto and MTP policies to the available heads, using EXL3_AUTO for EXL3 with DFlash2 and DFlash2 when MTP is absent."""
 
+        if code[0] in (6, 7) and (not self.full or self.w.mtp is None):
+            raise ValueError("experimental proposal policies require full GLM native MTP")
         if code[0] == 4 and self.drafter is not None and self.w.cfg.quant == "exl3":
             return encode_policy(EXL3_AUTO)
         if self.w.mtp is None and code[0] in (1, 2, 3, 4, 5):
@@ -426,11 +523,14 @@ class GlmEngine:
 
     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable[[list[int]], Any],
              code: list[int], hit, draft: bool, constraint=None) -> dict[str, Any]:
+        # a follower reaches its requests through here too, so the watchdog arms on every rank, not only rank 0
+        watch = self._watchdog(time.perf_counter(), len(prompt)) if WATCHDOG_S > 0 else None
         self.e.constraint, self.e.window = constraint, None       # both ranks walk and mask the same rows
         try:
             return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft)
         finally:
             self.e.constraint = self.e.window = None
+            self._disarm_watchdog(watch)
 
     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
                   on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool) -> dict[str, Any]:
@@ -489,8 +589,47 @@ class GlmEngine:
             stats["stages_ms"] = {k: round(v * 1e3, 1) for k, v in res.stages.items()}
         return stats
 
+    def _watchdog(self, started: float, prompt_len: int, *, timeout_s: float | None = None):
+        """One existing fault monitor per engine, armed only while a GPU command is active."""
+        timeout_s = WATCHDOG_S if timeout_s is None else timeout_s
+        if timeout_s <= 0:
+            return None
+        self._watchdog_next = getattr(self, "_watchdog_next", 0) + 1
+        token = self._watchdog_next
+        self._watchdog_active = (token, started, timeout_s, prompt_len)
+        if getattr(self, "_watchdog_thread", None) is None:
+            self._watchdog_stop = threading.Event()
+            def run():
+                while not self._watchdog_stop.wait(.05):
+                    active = getattr(self, "_watchdog_active", None)
+                    if active is None or time.perf_counter() - active[1] < active[2]:
+                        continue
+                    view = {"rank": self.rank, "world": self.world, "bell": getattr(self, "_bell", None),
+                            "seconds": time.perf_counter() - active[1], "prompt_len": active[3],
+                            "command": active[0], "pos": self.e.st.pos,
+                            "frames": getattr(getattr(self, "multi", None), "frames", None)}
+                    path = Path(WATCHDOG_DIR or ".") / f"hang_rank{self.rank}.json"
+                    try:
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text(json.dumps(view, indent=2) + "\n")
+                    except Exception:
+                        pass
+                    if getattr(self, "_watchdog_active", None) is not active:
+                        continue
+                    print(f"[watchdog] GLM rank group command timed out: {view}", flush=True)
+                    os._exit(3)
+                    return
+            self._watchdog_thread = threading.Thread(target=run, daemon=True)
+            self._watchdog_thread.start()
+        return token
+
+    def _disarm_watchdog(self, token):
+        active = getattr(self, "_watchdog_active", None)
+        if token is not None and active is not None and active[0] == token:
+            self._watchdog_active = None
+
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
-                 constraint=None) -> dict[str, Any]:
+                 constraint=None, background: bool = False) -> dict[str, Any]:
         """Mirror one rank-0 request on rank 1; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal."""
 
         if len(prompt) >= self.limit:
@@ -502,6 +641,9 @@ class GlmEngine:
             spec = getattr(self.request, "policy", None) or self.policy
         code = self._effective(encode_policy(spec))
         stop_eos = bool(getattr(self.request, "stop_eos", True))
+        if self.concurrent:
+            return self.scheduler.submit(list(prompt), max_tokens, sampling, draft, on_tokens, stop_eos,
+                                         constraint=constraint, background=background, options={"policy_code": code})
         hit = self._resume(list(prompt), code) if draft else None
         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
         header = [max_tokens, int(stop_eos), int(draft), len(hit.ids) if hit is not None else 0,
@@ -531,6 +673,16 @@ class GlmEngine:
             raise ValueError("empty labels")
         if len(prompt) >= self.limit:
             raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {self.limit}")
+        if self.concurrent:
+            from .multi import SCORE
+            with self.multi.lock:
+                if self.multi.live() or self.multi.failed:
+                    raise RuntimeError("GLM score_labels is only available while the concurrent decoder is idle")
+                with self.multi.command():
+                    self.multi._send([SCORE])
+                    self._share(prompt)
+                    self._share(labels)
+                    return self._score_local(prompt, labels)
         self._ring()                    # rank 1 waits on the store before this header, as a chat request does
         self._share([0, len(labels)])   # max_tokens on a chat header is at least 1, so 0 is a score
         self._share(prompt)
@@ -567,6 +719,8 @@ class GlmEngine:
 
         from tensorfold.engine.exact_sampling import Sampling
 
+        if self.concurrent:
+            return self.multi.follow()
         while True:
             self._await_bell()
             header = self._share(None)
@@ -595,3 +749,13 @@ class GlmEngine:
                     raise RuntimeError(f"rank 1 has no snapshot of the {cached} tokens rank 0 resumes from")
             self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),
                       constraint)
+
+
+    def close(self) -> None:
+        """Stop only this engine's scheduler and its own follower command loops."""
+        if self.scheduler is not None:
+            self.scheduler.close()
+            self.scheduler = None
+            self.multi.close()
+        if hasattr(self, "_watchdog_stop") and not getattr(self.multi, "failed", False):
+            self._watchdog_stop.set()

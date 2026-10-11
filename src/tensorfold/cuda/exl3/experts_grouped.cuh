@@ -136,7 +136,7 @@ __device__ __forceinline__ void load_words(uint32_t (&dst)[Fmt<K2>::LW], const u
 }
 
 // One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc, PF tiles in flight.
-template <int CB, int K2, int NT, int PF>
+template <int CB, int K2, int NT, int PF, int RM = 16, bool TRANSPOSE = false>
 __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int NTILES, int kt0, int nkt, int nt0,
                                            const half* x0, const half* x1, bool ok0, bool ok1, int lane,
                                            float (&acc)[NT][2][4]) {
@@ -173,8 +173,16 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int N
                 for (int i = 0; i < NT; ++i) {
                     uint32_t b0[2], b1[2];
                     decode_tile<CB, K2>(w[i], map, lane, b0, b1);
-                    mma16816(acc[i][0], a, b0);
-                    mma16816(acc[i][1], a, b1);
+                    if constexpr (TRANSPOSE) {
+                        // W^T[16,K] @ X^T[K,8] uses the same K16 MMA, with the
+                        // already-decoded fragments permuted into A. No K regrouping.
+                        uint32_t wa[4] = {b0[0], b1[0], b0[1], b1[1]};
+                        uint32_t xb[2] = {a[0], a[2]};
+                        mma16816(acc[i][0], wa, xb);
+                    } else {
+                        mma16816(acc[i][0], a, b0);
+                        mma16816(acc[i][1], a, b1);
+                    }
                 }
             }
         }
@@ -187,7 +195,7 @@ __host__ __device__ constexpr bool k2_supported(int k2) {
 }
 
 // Program (expert u, n block, split and member tile): up to 16 members times W_q over the split's K range; warps added in order.
-template <int CB, int NT, int W, int PF, int LO, int HI>
+template <int CB, int NT, int W, int PF, int LO, int HI, int RM = 16, bool SWIZZLE = false, bool TRANSPOSE = false, int FILTER = 0>
 __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
@@ -215,6 +223,8 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     }
     __syncthreads();
     if (rows_sh[0] < 0) return;                           // members come first, so this tile is empty
+    if constexpr (FILTER == 1) { if (rows_sh[8] >= 0) return; }
+    if constexpr (FILTER == 2) { if (rows_sh[8] < 0) return; }
     const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
     const half* x0 = X + (size_t)(r0 < 0 ? 0 : r0) * K + 2 * t;
     const half* x1 = X + (size_t)(r1 < 0 ? 0 : r1) * K + 2 * t;
@@ -235,7 +245,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
 #define TF_EXL3X_CASE(K2_)                                                                                      \
     case K2_:                                                                                                   \
         if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
-            warp_tiles<CB, K2_, NT, PF>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);    \
+            warp_tiles<CB, K2_, NT, PF, RM, TRANSPOSE>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);    \
         else                                                                                                    \
             __trap();                                                                                           \
         break;
@@ -259,26 +269,54 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
             __trap();
     }
 
-    // warps' partial sums through shared memory, added in warp order
-    __shared__ float red[W][16][NT * 16];
+    // A row-wise XOR permutation is bijective. For MMA stores the row bits
+    // occupy banks {0,3,4}, the lane's column bits {1,2}: all 32 lanes use
+    // distinct banks. Row-contiguous consumers also retain distinct banks.
+    // This changes addresses only, never the warp reduction order.
+    __shared__ float red[W][RM][NT * 16];
+    if constexpr (TRANSPOSE) {
+        const int ra = 2 * t, rb = ra + 1;
+        const int sa = (ra & 1) | ((ra & 6) << 2), sb = (rb & 1) | ((rb & 6) << 2);
+#pragma unroll
+        for (int i = 0; i < NT; ++i) {
+            const int col = i * 16 + g;
+            if (ra < RM && rows_sh[ra] >= 0) {
+                red[warp][ra][col ^ sa] = acc[i][0][0];
+                red[warp][ra][(col + 8) ^ sa] = acc[i][0][2];
+            }
+            if (rb < RM && rows_sh[rb] >= 0) {
+                red[warp][rb][col ^ sb] = acc[i][0][1];
+                red[warp][rb][(col + 8) ^ sb] = acc[i][0][3];
+            }
+        }
+    } else {
+    const int sw = SWIZZLE ? ((g & 1) | ((g & 6) << 2)) : 0;
 #pragma unroll
     for (int i = 0; i < NT; ++i)
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
             const int col = i * 16 + h * 8 + 2 * t;
-            red[warp][g][col] = acc[i][h][0];
-            red[warp][g][col + 1] = acc[i][h][1];
-            red[warp][g + 8][col] = acc[i][h][2];
-            red[warp][g + 8][col + 1] = acc[i][h][3];
+            if (g < RM && (!SWIZZLE || r0 >= 0)) {
+                red[warp][g][col ^ sw] = acc[i][h][0];
+                red[warp][g][(col + 1) ^ sw] = acc[i][h][1];
+            }
+            if constexpr (RM > 8) {
+                if (!SWIZZLE || r1 >= 0) {
+                    red[warp][g + 8][col ^ sw] = acc[i][h][2];
+                    red[warp][g + 8][(col + 1) ^ sw] = acc[i][h][3];
+                }
+            }
         }
+    }
     __syncthreads();
-    for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
+    for (int idx = threadIdx.x; idx < RM * NT * 16; idx += W * 32) {
         const int row = idx / (NT * 16), col = idx % (NT * 16);
         const int r = rows_sh[row];
         if (r < 0) continue;
-        float s = red[0][row][col];
+        const int sc = SWIZZLE ? (col ^ ((row & 1) | ((row & 6) << 2))) : col;
+        float s = red[0][row][sc];
 #pragma unroll
-        for (int w = 1; w < W; ++w) s += red[w][row][col];
+        for (int w = 1; w < W; ++w) s += red[w][row][sc];
         Z[(((size_t)mat * SK + split) * P + r) * N + nt0 * 16 + col] = s;
     }
 }
@@ -318,11 +356,57 @@ struct GroupedArgs {
     float* z;
     int K, N, P, SK, maxm, slots;
     int nexp_max;        // grid.x (upper bound of distinct experts)
-    int mats, nt, warps, pf, lo, hi;
+    int mats, nt, warps, pf, lo, hi, mode;
 };
+
+// Opt-in layouts use the same kernel, pointers and split partial ABI.
+template <int CB, int NT, int PF, int LO, int HI, int RM, bool TRANSPOSE = false, int FILTER = 0>
+void grouped_swizzled(const GroupedArgs& a, cudaStream_t stream) {
+    dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * NT)),
+              (unsigned)(a.mats * a.SK * ((a.maxm + 15) / 16)));
+    grouped_kernel<CB, NT, 4, PF, LO, HI, RM, true, TRANSPOSE, FILTER><<<grid, 128, 0, stream>>>(
+        a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members,
+        a.z, a.K, a.N, a.P, a.SK, a.maxm, a.slots);
+}
+
+template <int CB, int NT, int PF, int K2>
+void grouped_smallm(const GroupedArgs& a, cudaStream_t stream) {
+    if (a.mode == 3 && a.maxm <= 4) grouped_swizzled<CB, NT, PF, K2, K2, 4, true>(a, stream);
+    else if (a.mode == 3 && a.maxm <= 8) grouped_swizzled<CB, NT, PF, K2, K2, 8, true>(a, stream);
+    else if (a.mode == 3) {
+        // Disjoint member tiles, selected entirely on device. Keep the existing
+        // global kernel join before the epilogue; no atomic floating combination.
+        grouped_swizzled<CB, NT, PF, K2, K2, 8, true, 1>(a, stream);
+        grouped_swizzled<CB, NT, PF, K2, K2, 16, false, 2>(a, stream);
+    }
+    else if (a.maxm <= 4) grouped_swizzled<CB, NT, PF, K2, K2, 4>(a, stream);
+    else if (a.maxm <= 8) grouped_swizzled<CB, NT, PF, K2, K2, 8>(a, stream);
+    else grouped_swizzled<CB, NT, PF, K2, K2, 16>(a, stream);
+}
+
+template <int CB, int NT, int PF>
+void grouped_optimized(const GroupedArgs& a, cudaStream_t stream) {
+    if (a.mode >= 2 && a.lo == 6 && a.hi == 6) grouped_smallm<CB, NT, PF, 6>(a, stream);
+    else if (a.mode >= 2 && a.lo == 8 && a.hi == 8) grouped_smallm<CB, NT, PF, 8>(a, stream);
+    else if (a.lo == 8 && a.hi == 8) grouped_swizzled<CB, NT, PF, 8, 8, 16>(a, stream);
+    else if (a.lo >= 2 && a.hi <= 10) grouped_swizzled<CB, NT, PF, 2, 10, 16>(a, stream);
+    else grouped_swizzled<CB, NT, PF, 2, 16, 16>(a, stream);
+}
 
 template <int CB>
 void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
+    if constexpr (CB == 2) {
+        if (a.mode != 0) {
+            if (a.nt == 8 && a.warps == 4 && a.pf == 1) grouped_optimized<CB, 8, 1>(a, stream);
+            else if (a.nt == 8 && a.warps == 4 && a.pf == 2) grouped_optimized<CB, 8, 2>(a, stream);
+            else if (a.nt == 4 && a.warps == 4 && a.pf == 2) grouped_optimized<CB, 4, 2>(a, stream);
+            else if (a.nt == 4 && a.warps == 4 && a.pf == 4) grouped_optimized<CB, 4, 4>(a, stream);
+            else if (a.nt == 4 && a.warps == 4 && a.pf == 8) grouped_optimized<CB, 4, 8>(a, stream);
+            else if (a.nt == 8 && a.warps == 4 && a.pf == 4) grouped_optimized<CB, 8, 4>(a, stream);
+            else TORCH_CHECK(false, "unsupported optimized tile setting");
+            return;
+        }
+    }
     const int MT = (a.maxm + 15) / 16;
     dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MT));
 #define TF_LAUNCH(NT_, W_, PF_, LO_, HI_)                                                                       \

@@ -43,6 +43,7 @@ class Stream:
     prefill_s: float = 0.0
     started: float = 0.0
     finished: float = 0.0
+    options: dict = field(default_factory=dict)          # family-specific immutable request options
 
     def take(self, new: list[int], eos: Sequence[int] = ()) -> None:
         """Append a round's tokens and emit them; the stream ends at its count, an end token or a stop."""
@@ -82,7 +83,7 @@ class Stream:
 
         return Stream(self.prompt, self.count, self.sampling, draft=self.draft, stop_eos=self.stop_eos, emit=self.emit,
                       background=self.background, probabilities=self.probabilities,
-                      carry=self.stats(), owed=[*self.out, *self.owed])
+                      carry=self.stats(), owed=[*self.out, *self.owed], options=dict(self.options))
 
 
 def next_fill(filling: list[Stream]) -> Stream:

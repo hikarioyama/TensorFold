@@ -149,11 +149,14 @@ def make_handler(app: App):
             cancelled = lambda: gone.cancelled                  # noqa: E731
 
             def chunk(delta: dict[str, Any], finish: str | None = None) -> dict[str, Any]:
+                trace = delta.get("_token_trace")
+                visible = {k: v for k, v in delta.items() if k != "_token_trace"} if trace is not None else delta
+                extra = {"tensorfold": {"token_trace": trace}} if trace is not None else {}
                 if chat:
                     return {"id": rid, "object": kind, "created": created, "model": model,
-                            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+                            "choices": [{"index": 0, "delta": visible, "finish_reason": finish}], **extra}
                 return {"id": rid, "object": kind, "created": created, "model": model,
-                        "choices": [{"index": 0, "text": delta.get("content", ""), "finish_reason": finish}]}
+                        "choices": [{"index": 0, "text": visible.get("content", ""), "finish_reason": finish}], **extra}
 
             if stream:
                 self.send_response(200)

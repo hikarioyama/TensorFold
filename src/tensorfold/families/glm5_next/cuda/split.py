@@ -54,6 +54,8 @@ EXL3_RULES = {("gate", "trellis"): "dim1", ("gate", "suh"): "rep", ("gate", "svh
 def rule(name: str) -> str:
     if name.startswith("model.visual."):
         return "drop"
+    if name.startswith("model.") and not name.startswith("model.language_model."):
+        return rule_full(name)                            # GLM-5.3's HF-native names (``model.layers.*``)
     m = EXL3_EXPERT.search(name)
     if m:
         proj, part = m.groups()
@@ -62,6 +64,50 @@ def rule(name: str) -> str:
     if len(hits) != 1:
         raise ValueError(f"{name}: split rule is ambiguous or missing ({hits})")
     return hits[0]
+
+
+# -- GLM-5.3 (glm_moe_dsa): HF-native names (``model.layers.*``), EXL3 on every linear --------------------------
+# An EXL3 trellis is [K/16, N/16, 16 * bits]: a projection split by outputs takes tile columns (dim1) and svh rows,
+# one split by inputs takes tile rows (dim0) and suh rows; the other part is replicated. The ranks own whole heads,
+# whole experts and whole vocabulary blocks, so every boundary is a whole number of tiles and of 128-wide blocks.
+FULL_OUT = ("q_b_proj", "gate_proj", "up_proj", "kv_b_proj")   # N = heads * qk_dim, or an expert's width
+FULL_IN = ("o_proj", "down_proj")                         # K = heads * v_dim, or an expert's width
+FULL_OUT_RULE = {"trellis": "dim1", "mul1": "rep", "suh": "rep", "svh": "row", "weight": "row"}
+FULL_IN_RULE = {"trellis": "row", "mul1": "rep", "suh": "row", "svh": "rep", "weight": "col"}
+_FULL_LAYER = re.compile(r"^model\.layers\.\d+\.")
+_FULL_LINEAR = re.compile(r"^(?P<site>mlp\.(?:experts\.\d+\.|shared_experts\.)?|self_attn\.)"
+                          r"(?P<proj>[a-z_]+?)\.(?P<part>trellis|suh|svh|mul1|weight|bias)$")
+
+
+def rule_full(name: str) -> str:
+    """The rule for a GLM-5.3 tensor: which rank owns which part of it (raises, naming it, for one nothing claims)."""
+
+    if name in ("model.embed_tokens.weight", "model.norm.weight"):
+        return "rep"
+    if name == "lm_head.weight":                          # the head is BF16 there and splits by vocabulary
+        return "row"
+    m = _FULL_LAYER.match(name)
+    if m is None:
+        raise ValueError(f"{name}: GLM-5.3 split rule is missing for this tensor")
+    rest = name[m.end():]
+    if rest.startswith("self_attn.indexer.") or rest.startswith(("eh_proj.", "enorm.", "hnorm.")):
+        return "rep"                                      # the indexer, the MTP head's own projections
+    if rest in ("shared_head.norm.weight", "mlp.gate.weight", "mlp.gate.e_score_correction_bias"):
+        return "rep"
+    if rest.endswith(("input_layernorm.weight", "post_attention_layernorm.weight")) or \
+            rest.endswith(("q_a_layernorm.weight", "kv_a_layernorm.weight")):
+        return "rep"
+    g = _FULL_LINEAR.match(rest)
+    if g is None:
+        raise ValueError(f"{name}: GLM-5.3 split rule is missing for {rest!r}")
+    proj, part = g.group("proj"), g.group("part")
+    if part in ("bias",) or proj in ("q_a_proj", "kv_a_proj_with_mqa"):
+        return "rep"                                      # the latent path's projections, and every bias
+    if proj in FULL_OUT:
+        return FULL_OUT_RULE[part]
+    if proj in FULL_IN:
+        return FULL_IN_RULE[part]
+    raise ValueError(f"{name}: GLM-5.3 split rule is missing for projection {proj!r}")
 
 
 def read_header(path: str | Path) -> tuple[dict, int]:

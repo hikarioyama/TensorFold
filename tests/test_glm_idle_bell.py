@@ -26,8 +26,8 @@ def _ranks():
     port = _free_port()
     master = TCPStore("127.0.0.1", port, 2, True, timeout=timedelta(seconds=30), wait_for_workers=False)
     worker = TCPStore("127.0.0.1", port, 2, False, timeout=timedelta(seconds=30))
-    r0 = SimpleNamespace(comm=SimpleNamespace(store=master))
-    r1 = SimpleNamespace(comm=SimpleNamespace(store=worker))
+    r0 = SimpleNamespace(comm=SimpleNamespace(store=master), rank=0, world=2)
+    r1 = SimpleNamespace(comm=SimpleNamespace(store=worker), rank=1, world=2)
     for r in (r0, r1):
         for name in ("_store", "_ring", "_await_bell"):
             setattr(r, name, getattr(GlmEngine, name).__get__(r))
@@ -91,11 +91,37 @@ def test_idle_timeouts_are_retried_and_other_errors_raise():
             self.deleted.append(key)
 
     store = Store([RuntimeError("Socket Timeout"), RuntimeError("wait timeout after 3600000ms")])
-    r = SimpleNamespace(comm=SimpleNamespace(store=store))
+    r = SimpleNamespace(comm=SimpleNamespace(store=store), rank=1, world=2)
     for name in ("_store", "_ring", "_await_bell"):
         setattr(r, name, getattr(GlmEngine, name).__get__(r))
     r._await_bell()                                     # two idle hours, then the request
-    assert r._bell == 1 and store.deleted == ["tf_glm_request_1"]
+    assert r._bell == 1 and store.deleted == ["tf_glm_request_1_1"]
     r.comm.store = Store([RuntimeError("Connection reset by peer")])
     with pytest.raises(RuntimeError, match="Connection reset"):
         r._await_bell()                                 # rank 0 is gone: rank 1 stops instead of waiting forever
+
+
+@pytest.mark.parametrize("order", [(1, 2, 3), (3, 1, 2), (2, 3, 1)])
+def test_tp4_late_followers_do_not_lose_consumed_bells(order):
+    class Store:
+        def __init__(self):
+            self.keys = {}
+        def set(self, key, value):
+            self.keys[key] = value
+        def wait(self, keys, timeout):
+            assert all(k in self.keys for k in keys), "a previous follower deleted our bell"
+        def delete_key(self, key):
+            del self.keys[key]
+
+    store = Store()
+    ranks = [SimpleNamespace(comm=SimpleNamespace(store=store), rank=r, world=4) for r in range(4)]
+    for r in ranks:
+        for name in ("_store", "_ring", "_await_bell"):
+            setattr(r, name, getattr(GlmEngine, name).__get__(r))
+    for _ in range(100):
+        ranks[0]._ring()
+    for rank in order:
+        for _ in range(100):
+            ranks[rank]._await_bell()
+    assert not store.keys
+    assert [r._bell for r in ranks] == [100] * 4

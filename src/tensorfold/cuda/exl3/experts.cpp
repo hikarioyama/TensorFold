@@ -4,9 +4,10 @@
 void exl3x_grouped_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                         const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-                        int64_t, int64_t);
+                        int64_t, int64_t, int64_t);
 void exl3x_dequant_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 void exl3x_group_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
+void exl3x_group_ballot_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
 void exl3x_rot_in_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                        at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 void exl3x_gateup_epilogue_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
@@ -26,7 +27,8 @@ static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
 void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
              const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
              const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK,
-             int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo, int64_t hi) {
+             int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo, int64_t hi, int64_t mode) {
+    TORCH_CHECK(mode >= 0 && mode <= 3, "grouped mode must be in 0..3");
     check(X0, at::kHalf, "X0");
     check(X1, at::kHalf, "X1");
     check(TP0, at::kLong, "TP0");
@@ -41,7 +43,7 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, 
     TORCH_CHECK(X0.numel() >= P * K && X1.numel() >= P * K, "X too small");
     c10::cuda::CUDAGuard guard(X0.device());
     exl3x_grouped_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, SK, slots, cb, nt, warps,
-                       pf, lo, hi);
+                       pf, lo, hi, mode);
 }
 
 void dequant(const at::Tensor& T, at::Tensor out, int64_t k2, int64_t cb) {
@@ -66,6 +68,19 @@ void group(const at::Tensor& pick, at::Tensor uids, at::Tensor ucount, at::Tenso
     TORCH_CHECK(members.size(0) >= uids.numel() && members.size(1) >= 1, "members too small");
     c10::cuda::CUDAGuard guard(pick.device());
     exl3x_group_cuda(pick, uids, ucount, members, R, slots, E);
+}
+
+void group_ballot(const at::Tensor& pick, at::Tensor uids, at::Tensor ucount, at::Tensor members, int64_t R, int64_t slots,
+           int64_t E) {
+    check(pick, at::kInt, "pick");
+    check(uids, at::kInt, "uids");
+    check(ucount, at::kInt, "ucount");
+    check(members, at::kInt, "members");
+    TORCH_CHECK(pick.numel() >= R * slots, "pick too small");
+    TORCH_CHECK(uids.numel() >= std::min<int64_t>(R * slots, E), "uids too small");
+    TORCH_CHECK(members.size(0) >= uids.numel() && members.size(1) >= 1, "members too small");
+    c10::cuda::CUDAGuard guard(pick.device());
+    exl3x_group_ballot_cuda(pick, uids, ucount, members, R, slots, E);
 }
 
 void rot_in(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0,
@@ -130,9 +145,16 @@ void down_combine(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor&
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("grouped", &grouped);
+    m.def("grouped", &grouped,
+          pybind11::arg("X0"), pybind11::arg("X1"), pybind11::arg("TP0"), pybind11::arg("TP1"),
+          pybind11::arg("B0"), pybind11::arg("B1"), pybind11::arg("uids"), pybind11::arg("ucount"),
+          pybind11::arg("members"), pybind11::arg("Z"), pybind11::arg("mats"), pybind11::arg("K"),
+          pybind11::arg("N"), pybind11::arg("P"), pybind11::arg("SK"), pybind11::arg("slots"),
+          pybind11::arg("cb"), pybind11::arg("nt"), pybind11::arg("warps"), pybind11::arg("pf"),
+          pybind11::arg("lo"), pybind11::arg("hi"), pybind11::arg("mode") = 0);
     m.def("dequant", &dequant);
     m.def("group", &group);
+    m.def("group_ballot", &group_ballot);
     m.def("rot_in", &rot_in);
     m.def("gateup_epilogue", &gateup_epilogue);
     m.def("down_epilogue", &down_epilogue);

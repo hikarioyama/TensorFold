@@ -35,6 +35,7 @@ GLM-5.3-Flash images run on MLX; dense Qwen's run on MLX and CUDA. See
 | Qwen3.8-27B | `TensorFold/Qwen3.8-27B-MLX-4bit` | MLX, CUDA | `z-lab/Qwen3.8-27B-DFlash2` and context copies; DFlash2 is optional on MLX |
 | Qwen3.8 Flash Next | `TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP` | MLX, CUDA | Included MTP head and context copies |
 | GLM-5.3-Flash | `TensorFold/GLM-5.3-Flash-MLX-4bit-MTP` | MLX on a 256 GB Mac, CUDA with two ranks | MTP; optional DFlash2 on CUDA |
+| GLM-5.3 (753B, EXL3) | any EXL3 `glm_moe_dsa` checkpoint (see [GLM53-TP4.md](GLM53-TP4.md)) | CUDA, four ranks (TP=4) | Included MTP layer |
 | Gemma 4 26B-A4B | `mlx-community/gemma-4-26b-a4b-it-4bit` | MLX | Context copies; `z-lab/gemma-4-26B-A4B-it-DFlash` is optional |
 | DeepSeek-V4-Flash | `mlx-community/DeepSeek-V4-Flash-4bit` | MLX on a 256 GB Mac | `TensorFold/DeepSeek-V4-Flash-DSpark-MLX` or `TensorFold/DeepSeek-V4-Flash-MTP-MLX` |
 | Qwen3.8-27B (NVFP4) | `nvidia/Qwen3.8-27B-NVFP4` (ModelOpt: NVFP4 MLP, FP8 attention) | CUDA, one GPU | `z-lab/Qwen3.8-27B-DFlash2` and context copies |

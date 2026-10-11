@@ -45,6 +45,7 @@ def _engine(monkeypatch, cells, logits):
     engine.comm = None
     engine.rank = 0
     engine.limit = 1000
+    engine.concurrent = False
     engine._share = lambda values: list(values)
     return engine
 

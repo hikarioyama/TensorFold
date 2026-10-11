@@ -11,6 +11,9 @@ import torch
 from . import format as fmt
 
 CODEBOOK_IDS = {"3inst": 0, "mcg": 1, "mul1": 2}
+ROWS = 128                 # rows a call takes; a caller with more dispatches tiles (never a row of its own)
+# A pair call rotates both parts' input in one launch (plan K1-b2); off keeps two rot_in launches for an A/B.
+PAIR_ROT2 = True
 
 
 @lru_cache(maxsize=1)
@@ -18,7 +21,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_exl3_linear_v3", sources=[str(here / "linear.cpp"), str(here / "linear.cu")],
+    return load(name="tensorfold_exl3_linear_v4", sources=[str(here / "linear.cpp"), str(here / "linear.cu")],
                 extra_include_paths=[str(here)], extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
                 verbose=False)
 
@@ -45,6 +48,111 @@ def plan(k: int, n: int, blocks: int = 192, min_tiles: int = 8) -> tuple[int, in
     return sk, wk
 
 
+CANDIDATE_SK = (1, 2, 4, 8, 16, 32, 64)     # K splits to try a shape
+TUNED: dict[tuple[int, int, float], tuple[int, int]] = {}
+
+# Decided splits, distributed instead of re-measured (plan §5.1 items 5-7): probe/tune_shapes.py sweeps every real
+# rank shape of a checkpoint under the four ranks' load and records one (K splits, warps) a shape. A run installs that
+# manifest, so all ranks use one arithmetic revision, and an unknown shape is swept on its own (and reported as such)
+# rather than silently racing the ranks to different winners.
+MANIFEST: dict[tuple[int, int, float, str], tuple[int, int]] = {}
+MANIFEST_INFO: dict = {}
+
+
+def install_manifest(path: str | Path) -> dict:
+    """Read a ``tune_shapes`` manifest into ``MANIFEST``; returns what was installed (and what it did not cover)."""
+
+    import json
+
+    doc = json.loads(Path(path).read_text())
+    MANIFEST.clear()
+    for got in doc.get("shapes", {}).values():
+        MANIFEST[(int(got["k"]), int(got["n"]), float(got["bits"]), got["codebook"])] = tuple(got["chosen"])
+    MANIFEST_INFO.clear()
+    MANIFEST_INFO.update(path=str(path), shapes=len(MANIFEST), m=doc.get("m"), margin=doc.get("margin"),
+                         source=doc.get("source", {}), checkpoint_plan_sha256=doc.get("checkpoint_plan_sha256"),
+                         disagreements=doc.get("disagreements", []),
+                         worst_confirmation_loss_pct=doc.get("worst_confirmation_loss_pct"))
+    return dict(MANIFEST_INFO)
+
+
+def manifest_split(layer: "Exl3Linear") -> tuple[int, int] | None:
+    """The recorded split for this shape, or None when the manifest does not cover it."""
+
+    if not MANIFEST:
+        return None
+    return MANIFEST.get((layer.k, layer.n, float(layer.bits), layer.codebook))
+
+
+def candidates(k: int, n: int) -> list[tuple[int, int]]:
+    """(K splits, warps) a K x N layer may use, the planned one first, then longer grids.
+
+    ``plan`` sizes a program's work for a prompt-sized M, which leaves a one-row decode with too few programs to hide
+    DRAM latency; a longer grid is what buys throughput there (measured: 54 us at 8 programs, 9 us at 512, for the same
+    tensors).
+    """
+
+    out = [plan(k, n)]
+    for wk in (4, 8, 2):
+        for sk in CANDIDATE_SK:
+            tiles = (k // 16) // (sk * wk)
+            if (k // 16) % (sk * wk) or tiles < 1:
+                continue
+            if (sk, wk) not in out:
+                out.append((sk, wk))
+    return out
+
+
+def tune(layer: "Exl3Linear", m: int = 3, rounds: int = 10, margin: float = 0.98) -> tuple[int, int]:
+    """This layer's split: the installed manifest's entry, else measure once a shape and cache by (k, n, bits).
+
+    A 2% margin keeps a near-tie on the earlier candidate. A manifest entry is one decided setting for every rank and
+    every row count; without one, four ranks measuring the same shape can settle on different winners, which is a
+    different K partition (a different arithmetic revision) per rank, so those shapes are recorded as uncovered.
+    """
+
+    key = (layer.k, layer.n, layer.bits)
+    found = TUNED.get(key)
+    if found is not None:
+        layer.split = found
+        return found
+    decided = manifest_split(layer)
+    if decided is not None:
+        layer.split = TUNED[key] = decided
+        return decided
+    if MANIFEST:
+        missing = MANIFEST_INFO.setdefault("uncovered", [])
+        if key not in missing:
+            missing.append(list(key))
+    dev = layer.words.device
+    x = (torch.randn(m, layer.k, dtype=torch.float32, device=dev) * 0.05).to(torch.bfloat16)
+    out = torch.empty((m, layer.n), dtype=torch.bfloat16, device=dev)
+    xh = torch.empty((m, layer.k), dtype=torch.float16, device=dev)
+    z = torch.empty((CANDIDATE_SK[-1] * m * layer.n,), dtype=torch.float32, device=dev)
+    counters = torch.zeros((8 * (layer.n // 128),), dtype=torch.int32, device=dev)
+    best, best_secs = layer.split, float("inf")
+    for cand in candidates(layer.k, layer.n):
+        layer.split = cand
+        try:
+            layer(x, out=out, xh=xh, z=z, counters=counters)
+        except Exception:                     # noqa: BLE001  a split the kernel refuses is simply not a candidate
+            continue
+        torch.cuda.synchronize()
+        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+        start.record()
+        for _ in range(rounds):
+            layer(x, out=out, xh=xh, z=z, counters=counters)
+        end.record()
+        torch.cuda.synchronize()
+        secs = start.elapsed_time(end) / rounds
+        if secs < best_secs * margin:
+            best, best_secs = cand, secs
+    layer.split = best
+    TUNED[key] = best
+    del x, out, xh, z, counters
+    return best
+
+
 def strips(words: torch.Tensor) -> torch.Tensor:
     """Trellis words [K/16, N/16, W] -> [N/128, K/16, 8, W]: each 128-column block's tiles in k order (a copy)."""
 
@@ -66,6 +174,7 @@ class Exl3Linear:
     n: int
     layout: str = "strips"
     split: tuple[int, int] | None = None     # (K splits, warps a program); plan(k, n) when None, fixed thereafter
+    kernel_mode: int = 0                     # 1: bit-tested transposed MMA for M<=8
 
     @classmethod
     def from_tensors(cls, trellis: torch.Tensor, suh: torch.Tensor, svh: torch.Tensor, codebook: str,
@@ -162,26 +271,49 @@ class Exl3Linear:
             self._counters = c
         return c
 
-    def __call__(self, x: torch.Tensor, out: torch.Tensor | None = None, out_dtype: torch.dtype | None = None,
-                 xh: torch.Tensor | None = None, z: torch.Tensor | None = None) -> torch.Tensor:
-        """y [M, N] = x [M, K] @ W + bias for M = 1..128; scratch ``xh`` fp16 [M, K] and ``z`` fp32 (SK > 1) allocated when not given."""
+    def workspace(self, device: torch.device, rows: int = ROWS) -> tuple[torch.Tensor, torch.Tensor | None,
+                                                                         torch.Tensor]:
+        """This layer's per-call scratch for one slot to own: the rotated input, the split-K partials, the counters.
 
-        if x.dim() != 2 or x.shape[1] != self.k or not 1 <= x.shape[0] <= 128:
-            raise ValueError(f"x must be [1..128, {self.k}], got {tuple(x.shape)}")
+        One execution slot (a sequence's buffers, its graph instances) owns them, so two streams never share a
+        projection's mutable scratch; the kernel clears each counter block it completes, so the tensors are reusable
+        as they are.
+        """
+
+        rows = min(rows, ROWS)
+        sk, _ = self.split
+        xh = torch.empty((rows, self.k), dtype=torch.float16, device=device)
+        z = torch.empty((sk * rows * self.n,), dtype=torch.float32, device=device) if sk > 1 else None
+        return xh, z, torch.zeros((8 * (self.n // 128),), dtype=torch.int32, device=device)
+
+    def __call__(self, x: torch.Tensor, out: torch.Tensor | None = None, out_dtype: torch.dtype | None = None,
+                 xh: torch.Tensor | None = None, z: torch.Tensor | None = None,
+                 counters: torch.Tensor | None = None) -> torch.Tensor:
+        """y [M, N] = x [M, K] @ W + bias for M = 1..128 (``ROWS``); scratch ``xh`` fp16 [M, K], ``z`` fp32 (SK > 1)
+        and ``counters`` allocated when not given (a slot passes its own through ``workspace``)."""
+
+        if x.dim() != 2 or x.shape[1] != self.k or not 1 <= x.shape[0] <= ROWS:
+            raise ValueError(f"x must be [1..{ROWS}, {self.k}], got {tuple(x.shape)}")
         x = x.contiguous()
         m = x.shape[0]
         if out is None:
             out = torch.empty((m, self.n), dtype=out_dtype or x.dtype, device=x.device)
         sk, wk = self.split
-        if xh is None:
+        need = sk * m * self.n
+        if xh is None or xh.shape[0] < m:
             xh = torch.empty((m, self.k), dtype=torch.float16, device=x.device)
-        if sk > 1 and z is None:
-            z = torch.empty((sk * m * self.n,), dtype=torch.float32, device=x.device)
+        elif xh.shape[0] > m:
+            xh = xh[:m]                       # a slot's scratch is sized for a whole tile, not this call's rows
+        if sk > 1:
+            if z is None or z.numel() < need:
+                z = torch.empty((need,), dtype=torch.float32, device=x.device)
+            elif z.numel() > need:
+                z = z[:need]
         sk_stride, nb_stride = self.strides
         ext = _ext()
         ext.rot_in(x, self.suh, xh)
         ext.linear(xh, self.words, sk_stride, nb_stride, self.svh, self.bias, out, z if sk > 1 else None,
-                   self.counters, self.k2, CODEBOOK_IDS[self.codebook], sk, wk)
+                   self.counters if counters is None else counters, self.k2, CODEBOOK_IDS[self.codebook], sk, wk, self.kernel_mode)
         return out
 
     def unpack(self, out: torch.Tensor | None = None) -> torch.Tensor:
@@ -190,6 +322,51 @@ class Exl3Linear:
         w = out if out is not None else torch.empty((self.k, self.n), dtype=torch.float16, device=self.words.device)
         _ext().unpack(self.words, w, *self.strides, self.k2, CODEBOOK_IDS[self.codebook])
         return w
+
+
+def pair_compatible(a: "Exl3Linear", b: "Exl3Linear", k: int) -> bool:
+    """Whether two projections can share one launch: same input shape and width, same output layout.
+
+    The pair kernel gives each part its own weights, scales, bias, output, split-K scratch and counters and only
+    shares the launch and the SMs, so the arithmetic of a part is exactly a launch of its own. What it cannot share
+    is the template: the trellis width/codebook (the decode is compiled) and the program's warp count (the block
+    size), so those have to match. The two K splits may differ.
+    """
+
+    return (a.k == b.k == k and a.k2 == b.k2 and a.k2 in (6, 8, 10, 12) and a.codebook == b.codebook == "mul1"
+            and a.kernel_mode == b.kernel_mode and a.layout == b.layout and a.split is not None and b.split is not None and a.split[1] == b.split[1])
+
+
+def pair_call(a: "Exl3Linear", b: "Exl3Linear", x: torch.Tensor, out_a: torch.Tensor, out_b: torch.Tensor,
+              ws_a: tuple | None = None, ws_b: tuple | None = None) -> None:
+    """One launch for two EXL3 projections of ``x`` (plan K1-b's multi-projection); callers must check ``pair_compatible``."""
+
+    m = x.shape[0]
+    xh_a, z_a, c_a = (None, None, None) if ws_a is None else ws_a
+    xh_b, z_b, c_b = (None, None, None) if ws_b is None else ws_b
+    if xh_a is None or xh_a.shape[0] < m:
+        xh_a = torch.empty((m, a.k), dtype=torch.float16, device=x.device)
+    else:
+        xh_a = xh_a[:m]
+    if xh_b is None or xh_b.shape[0] < m:
+        xh_b = torch.empty((m, b.k), dtype=torch.float16, device=x.device)
+    else:
+        xh_b = xh_b[:m]
+    ext = _ext()
+    if PAIR_ROT2:                                # one launch: the parts share the input rows but not their suh
+        ext.rot_in2(x, a.suh, xh_a, b.suh, xh_b)
+    else:
+        ext.rot_in(x, a.suh, xh_a)
+        ext.rot_in(x, b.suh, xh_b)
+    sk_a, wk = a.split
+    sk_b, _ = b.split
+    z_a = None if sk_a == 1 else (z_a if z_a is not None and z_a.numel() >= sk_a * m * a.n
+                                  else torch.empty((sk_a * m * a.n,), dtype=torch.float32, device=x.device))
+    z_b = None if sk_b == 1 else (z_b if z_b is not None and z_b.numel() >= sk_b * m * b.n
+                                  else torch.empty((sk_b * m * b.n,), dtype=torch.float32, device=x.device))
+    ext.linear2(xh_a, a.words, *a.strides, a.svh, a.bias, out_a, z_a,
+                a.counters if c_a is None else c_a, xh_b, b.words, *b.strides, b.svh, b.bias, out_b, z_b,
+                b.counters if c_b is None else c_b, a.k2, CODEBOOK_IDS[a.codebook], sk_a, sk_b, wk, a.kernel_mode)
 
 
 def unpack_cuda(trellis: torch.Tensor, codebook: str) -> torch.Tensor:

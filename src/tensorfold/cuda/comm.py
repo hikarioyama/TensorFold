@@ -39,7 +39,11 @@ def _library() -> ctypes.CDLL:
     found = ctypes.util.find_library("nccl")
     if found:
         candidates.append(found)
-    candidates += glob.glob("/usr/lib/*/libnccl.so.2") + glob.glob("/usr/local/lib/python3*/dist-packages/nvidia/nccl/lib/libnccl.so.2")
+    candidates += glob.glob("/usr/lib/*/libnccl.so.2")
+    # the nvidia-nccl wheel: site-packages for a user install, dist-packages in an image
+    candidates += glob.glob("/usr/local/lib/python3*/{site,dist}-packages/nvidia/nccl/lib/libnccl.so.2")
+    candidates += glob.glob("/usr/lib/python3*/{site,dist}-packages/nvidia/nccl/lib/libnccl.so.2")
+    candidates += glob.glob(os.path.expanduser("~/.local/lib/python3*/site-packages/nvidia/nccl/lib/libnccl.so.2"))
     candidates += glob.glob(os.path.join(os.path.dirname(torch.__file__), "lib", "libnccl*.so*"))
     for path in candidates:
         if path:
@@ -226,3 +230,45 @@ def open_comm(rank: int, world: int, master: str, port: int, *, backend: str | N
         if len(set(names)) > 1:
             raise RuntimeError(f"the ranks were started with different {BACKEND_ENV}: {', '.join(names)} (rank order)")
     return base if name == "nccl" else BACKENDS[name](base)
+
+
+class FixedIntBroadcast:
+    def __init__(self, comm, device, capacity=64, *, rank=None):
+        self.comm,self.capacity,self.failed=comm,capacity,False
+        self.rank = comm.rank if rank is None else int(rank)
+        if not 0 <= self.rank < comm.world or capacity < 1:
+            raise ValueError("invalid fixed control rank/capacity")
+        self.send=torch.empty(capacity+1,dtype=torch.int32,device=device)
+        self.recv=torch.empty((capacity+1)*comm.world,dtype=torch.int32,device=device)
+        self.host=torch.empty(capacity+1,dtype=torch.int32,pin_memory=self.send.is_cuda)
+        self.readback=torch.empty_like(self.host,pin_memory=self.send.is_cuda)
+        self.done=torch.cuda.Event() if self.send.is_cuda else None
+
+    def broadcast(self, values, *, limit=None, allow_empty=True):
+        if self.failed:raise RuntimeError('control frame failed; restart rank group')
+        import operator
+        limit=self.capacity if limit is None else limit
+        if not 1<=limit<=self.capacity:raise ValueError('invalid fixed frame capacity')
+        nwords=limit+1
+        data=self.host.numpy()
+        data[:nwords]=0
+        if self.rank==0:
+            try:
+                payload=[operator.index(v) for v in values]
+                valid=(int(not allow_empty)<=len(payload)<=limit and all(-2**31<=v<2**31 for v in payload))
+            except (TypeError,OverflowError):
+                payload,valid=[],False
+            data[0]=len(payload) if valid else -1
+            if valid:data[1:1+len(payload)]=payload
+        self.send[:nwords].copy_(self.host[:nwords],non_blocking=self.send.is_cuda)
+        self.comm.all_gather(self.send[:nwords],self.recv[:self.comm.world*nwords])
+        self.readback[:nwords].copy_(self.recv[:nwords],non_blocking=self.send.is_cuda)
+        if self.done is not None:
+            self.done.record()
+            self.done.synchronize()
+        result=self.readback.numpy()
+        count=int(result[0])
+        if not int(not allow_empty)<=count<=limit:
+            self.failed=True
+            raise RuntimeError('invalid bounded control frame; restart rank group')
+        return result[1:1+count].tolist()

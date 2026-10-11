@@ -65,6 +65,14 @@ GLM's CUDA engine implements transformers' `models/glm5_next/modular_glm5_next.p
 without including that source. Its draft inputs and thinking-off rendering follow the public GLM recipe
 from Mia-AiLab without including recipe code.
 
+GLM-5.3 (`glm_moe_dsa`) support adds a second path beside that engine. Its DSA sparse indexer
+(`families/glm5_next/cuda/sparse53.py`) follows the indexer of DeepSeek's sparse attention as GLM-5.3's
+reference implementation computes it (`modules/mla_attn.py`: `_indexer_keys` / `_indexer_topk`, and
+`attention_fn/dsa_triton.py`), and its rotary positions (`cuda/rope.py`) follow the reference's interleaved
+pair layout. TensorFold's kernels are written for TensorFold and checked against an independent reference
+of that arithmetic; no reference source is included. The indexer's rotation and scoring conventions are
+also recorded in `families/glm5_next/mla.py`.
+
 GLM EXL3 (`families/glm5_next/cuda/exl3.py`, `exl3.cu`, `exl3_mm.py`), the shared EXL3 module
 (`src/tensorfold/cuda/exl3/`) and the EXL3 loaders of Qwen3.8-27B and Qwen3.8 Flash Next
 (`families/qwen3_5/cuda/exl3_load.py`, `families/qwen4_exp/cuda/exl3.py`) read

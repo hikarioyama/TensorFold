@@ -71,6 +71,69 @@ __global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restr
     }
 }
 
+// Small decode plan: match equal picks within each warp, then scan the resulting
+// expert bitmasks. No atomics and no serial scan of every pick by every expert.
+// IDs stay ascending, members stay in row/slot order, and generic truncation stays exact.
+constexpr int SMALL_GROUP_THREADS = 256;
+__global__ void __launch_bounds__(SMALL_GROUP_THREADS) group_ballot_kernel(
+    const int* __restrict__ pick, int* __restrict__ uids, int* __restrict__ ucount,
+    int* __restrict__ members, int R, int slots, int E, int maxm) {
+    extern __shared__ int storage[];
+    const int n = R * slots, chunks = (n + 31) / 32;
+    unsigned* masks = reinterpret_cast<unsigned*>(storage);
+    int* places = storage + E * chunks;
+    int* warp_tot = places + E;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    for (int i = tid; i < E * chunks; i += SMALL_GROUP_THREADS) masks[i] = 0;
+    __syncthreads();
+    for (int base = 0; base < n; base += SMALL_GROUP_THREADS) {
+        const int p = base + tid, e = p < n ? pick[p] : -1;
+        const unsigned bits = __match_any_sync(0xffffffffu, e);
+        if (e >= 0 && e < E && lane == __ffs(bits) - 1) masks[(p / 32) * E + e] = bits;
+    }
+    __syncthreads();
+    unsigned any = 0;
+    if (tid < E)
+        for (int c = 0; c < chunks; ++c) any |= masks[c * E + tid];
+    const int used = any != 0;
+    int inc = used;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int v = __shfl_up_sync(0xffffffffu, inc, o);
+        if (lane >= o) inc += v;
+    }
+    if (lane == 31) warp_tot[warp] = inc;
+    __syncthreads();
+    if (warp == 0) {
+        const int v = lane < 8 ? warp_tot[lane] : 0;
+        int sum = v;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int x = __shfl_up_sync(0xffffffffu, sum, o);
+            if (lane >= o) sum += x;
+        }
+        if (lane < 8) warp_tot[lane] = sum - v;
+        if (lane == 31) { ucount[0] = sum; warp_tot[8] = sum; }
+    }
+    __syncthreads();
+    if (tid < E) {
+        const int place = warp_tot[warp] + inc - used;
+        places[tid] = used ? place : -1;
+        if (used) uids[place] = tid;
+    }
+    for (int j = tid; j < warp_tot[8] * maxm; j += SMALL_GROUP_THREADS) members[j] = -1;
+    __syncthreads();
+    for (int base = 0; base < n; base += SMALL_GROUP_THREADS) {
+        const int p = base + tid, e = p < n ? pick[p] : -1;
+        const unsigned bits = __match_any_sync(0xffffffffu, e);
+        if (e >= 0 && e < E) {
+            int at = __popc(bits & ((1u << lane) - 1));
+            for (int c = 0; c < p / 32; ++c) at += __popc(masks[c * E + e]);
+            if (at < maxm) members[places[e] * maxm + at] = (p / slots) * 32 + (p % slots);
+        }
+    }
+}
+
 // Walsh-Hadamard transform of 128 values, 4 a lane, fixed butterfly order (strides 1, 2 in registers, 4..64 across lanes).
 __device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
     float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
@@ -253,7 +316,7 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
                         const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
                         const at::Tensor& members, at::Tensor& Z, int64_t mats, int64_t K, int64_t N, int64_t P,
                         int64_t SK, int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo,
-                        int64_t hi) {
+                        int64_t hi, int64_t mode) {
     TORCH_CHECK(K % (16 * SK * warps) == 0 && N % (16 * nt) == 0, "K and N must split evenly");
     tf_exl3x::GroupedArgs a;
     a.x0 = reinterpret_cast<const half*>(X0.data_ptr());
@@ -268,6 +331,7 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
     a.z = Z.data_ptr<float>();
     a.K = (int)K; a.N = (int)N; a.P = (int)P; a.SK = (int)SK; a.maxm = (int)members.size(1); a.slots = (int)slots;
     a.nexp_max = (int)uids.size(0);
+    a.mode = (int)mode;
     a.mats = (int)mats; a.nt = (int)nt; a.warps = (int)warps; a.pf = (int)pf; a.lo = (int)lo; a.hi = (int)hi;
     auto stream = at::cuda::getCurrentCUDAStream();
     if (cb == 0) tf_exl3x::grouped_launch<0>(a, stream);
@@ -306,6 +370,25 @@ void exl3x_group_cuda(const at::Tensor& pick, at::Tensor& uids, at::Tensor& ucou
     group_kernel<<<1, GROUP_THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
         pick.data_ptr<int>(), uids.data_ptr<int>(), ucount.data_ptr<int>(), members.data_ptr<int>(), (int)R,
         (int)slots, (int)E, (int)members.size(1));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Additive entry point: unsupported sizes retain the existing generic plan.
+void exl3x_group_ballot_cuda(const at::Tensor& pick, at::Tensor& uids, at::Tensor& ucount,
+                           at::Tensor& members, int64_t R, int64_t slots, int64_t E) {
+    if (R < 1 || R > 128 || slots < 1 || slots > 32 || E < 1 || E > 256) {
+        exl3x_group_cuda(pick, uids, ucount, members, R, slots, E);
+        return;
+    }
+    const int n = (int)(R * slots), chunks = (n + 31) / 32;
+    const size_t smem = (E * chunks + E + 9) * sizeof(int);
+    if (smem > 48 * 1024) {
+        exl3x_group_cuda(pick, uids, ucount, members, R, slots, E);
+        return;
+    }
+    group_ballot_kernel<<<1, SMALL_GROUP_THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
+        pick.data_ptr<int>(), uids.data_ptr<int>(), ucount.data_ptr<int>(), members.data_ptr<int>(),
+        (int)R, (int)slots, (int)E, (int)members.size(1));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

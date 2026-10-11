@@ -26,7 +26,7 @@ def _ext():
 
     here = Path(__file__).parent
     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
-    return load(name="tensorfold_exl3_experts_v1", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    return load(name="tensorfold_exl3_experts_v2", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -146,7 +146,15 @@ def default_config(K: int, N: int, gateup: bool) -> tuple[int, int, int, int]:
 class Scratch:
     """Buffers for up to ``rows`` rows of ``slots`` slots; slots whose pick is not a routed expert are left to the caller."""
 
-    def __init__(self, ex: Exl3RoutedExperts, rows: int, slots: int, cfg_gu=None, cfg_d=None, device="cuda") -> None:
+    def __init__(self, ex: Exl3RoutedExperts, rows: int, slots: int, cfg_gu=None, cfg_d=None, device="cuda", grouped_mode: int = 0, route_mode: int = 0) -> None:
+        if grouped_mode not in (0, 1, 2, 3):
+            raise ValueError("grouped_mode must be in 0..3")
+        if route_mode not in (0, 1):
+            raise ValueError("route_mode must be 0 or 1")
+        self.route_mode = route_mode
+        self.grouped_mode = grouped_mode
+        self.adaptive_tiles = False
+        self.transpose_nt4_at8 = False
         D, I = ex.dims, ex.width
         self.cfg_gu = cfg_gu or default_config(D, I, True)
         self.cfg_d = cfg_d or default_config(I, D, False)
@@ -170,11 +178,23 @@ class Scratch:
         return self.ids[:maxu], self.members_buf[:maxu * R].view(maxu, R)
 
 
+def grouped_config(s: Scratch, config, rows: int):
+    """Change N/prefetch geometry only; preserve the configured warp and K partitions."""
+    nt, w, sk, pf = config
+    if s.adaptive_tiles:
+        nt, pf = (8 if s.grouped_mode == 3 else (4 if rows <= 8 else 8)), 2
+        if s.grouped_mode == 3 and getattr(s, "transpose_nt4_at8", False) and rows == 8:
+            nt = 4
+    return nt, w, sk, pf
+
+
 def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
-           group: bool = True) -> torch.Tensor:
+           group: bool = True, defer_down: bool = False) -> torch.Tensor:
     """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync."""
 
+    if defer_down and (wts is not None or out is not None):
+        raise ValueError("deferred down expects finish_routed to receive weights and output")
     ext = _ext()
     D, I, E = ex.dims, ex.width, ex.count
     slots = s.slots
@@ -183,15 +203,18 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         raise ValueError(f"{R} rows but the scratch holds {s.rows}")
     ids, members = s.window(R)
     if group:
-        ext.group(pick, ids, s.count, members, R, slots, E)
+        route = ext.group_ballot if s.route_mode else ext.group
+        route(pick, ids, s.count, members, R, slots, E)
     ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
-    nt, w, sk, pf = s.cfg_gu
+    nt, w, sk, pf = grouped_config(s, s.cfg_gu, R)
     ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
-                P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1])
+                P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1], s.grouped_mode)
     ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, sk, slots, E, float(limit), act_mode)
-    nt, w, sk, pf = s.cfg_d
+    nt, w, sk, pf = grouped_config(s, s.cfg_d, R)
     ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
-                D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1])
+                D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1], s.grouped_mode)
+    if defer_down:
+        return s.z
     if wts is None:
         ext.down_epilogue(s.z, pick, ex.svh_d, s.y, R, P, D, sk, slots, E)
         return s.y[:P]
@@ -199,6 +222,13 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         out = torch.empty((R, D), dtype=torch.float32, device=x.device)
     # the down epilogue and the combine in one launch (the same arithmetic in the same order as the two)
     ext.down_combine(s.z, pick, ex.svh_d, s.y, wts, out, R, P, D, sk, slots, E)
+    return out
+
+
+def finish_routed(pick, wts, ex, scratch, out, rows):
+    """Finish deferred down partials after the caller's shared-expert event; combine in slot order."""
+    _ext().down_combine(scratch.z, pick, ex.svh_d, scratch.y, wts, out, rows,
+                        rows * scratch.slots, ex.dims, scratch.cfg_d[2], scratch.slots, ex.count)
     return out
 
 

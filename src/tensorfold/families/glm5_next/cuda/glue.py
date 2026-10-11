@@ -253,33 +253,45 @@ def stream_mean(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
 
 # -- MLP and MoE ----------------------------------------------------------------------------------------------
 @triton.jit
-def _swiglu(GU, OUT, XS, LIMIT, W: tl.constexpr, BLOCK: tl.constexpr):
-    """Dense MLP: [gate | up] (bf16) -> bf16(bf16(silu(min(g, L))) * clip(u, -L, L)) and its 64-group sums."""
+def _swiglu(GU, OUT, XS, LIMIT, W: tl.constexpr, BLOCK: tl.constexpr, CLAMP: tl.constexpr, SUMS: tl.constexpr):
+    """Dense MLP: [gate | up] (bf16) -> bf16(bf16(silu(min(g, L))) * clip(u, -L, L)) and its 64-group sums.
+
+    ``CLAMP`` is false where the checkpoint states no swiglu limit (GLM-5.3 has no ``swiglu_limit``): the gate and the
+    up value are then used as they are (a limit of zero would clamp every activation to zero).
+    """
 
     r = tl.program_id(0)
     cb = tl.program_id(1)
     d = cb * BLOCK + tl.arange(0, BLOCK)
-    g = tl.minimum(tl.load(GU + r * (2 * W) + d).to(tl.float32), LIMIT)
+    g = tl.load(GU + r * (2 * W) + d).to(tl.float32)
     u = tl.load(GU + r * (2 * W) + W + d).to(tl.float32)
-    u = tl.minimum(tl.maximum(u, -LIMIT), LIMIT)
+    if CLAMP:
+        g = tl.minimum(g, LIMIT)
+        u = tl.minimum(tl.maximum(u, -LIMIT), LIMIT)
     a = ((g / (1.0 + tl.exp(-g))).to(tl.bfloat16).to(tl.float32) * u).to(tl.bfloat16)
     tl.store(OUT + r * W + d, a)
-    s = tl.sum(tl.reshape(a.to(tl.float32), (BLOCK // 64, 64)), axis=1)
-    tl.store(XS + r * (W // 64) + cb * (BLOCK // 64) + tl.arange(0, BLOCK // 64), s)
+    if SUMS:
+        g = tl.sum(tl.reshape(a.to(tl.float32), (BLOCK // 64, 64)), axis=1)
+        tl.store(XS + r * (W // 64) + cb * (BLOCK // 64) + tl.arange(0, BLOCK // 64), g)
 
 
-def swiglu(gu: torch.Tensor, out: torch.Tensor, xs: torch.Tensor, limit: float) -> None:
+def swiglu(gu: torch.Tensor, out: torch.Tensor, xs: torch.Tensor | None, limit: float) -> None:
     rows, w = out.shape
     block = math.gcd(512, w)             # 512 for every width of the model; narrower widths (tests) get all columns
     if block < 64:
         raise ValueError(f"swiglu: width {w} is not a multiple of 64")
-    _swiglu[(rows, w // block)](gu, out, xs, float(limit), W=w, BLOCK=block, num_warps=4)
+    _swiglu[(rows, w // block)](gu, out, xs if xs is not None else out, float(limit), W=w, BLOCK=block,
+                                CLAMP=float(limit) > 0, SUMS=xs is not None, num_warps=4)
 
 
 @triton.jit
 def _router(X, W, OUT, M, x_stride, D: tl.constexpr, NE: tl.constexpr, BM: tl.constexpr,
-            BLOCK_E: tl.constexpr, BK: tl.constexpr):
-    """OUT[m, e] = fp32 x[m] . w[e] (bf16 inputs, tensor cores, K in BK steps in order)."""
+            BLOCK_E: tl.constexpr, BK: tl.constexpr, F16: tl.constexpr):
+    """OUT[m, e] = fp32 x[m] . w[e] (the weight's own dtype, tensor cores, K in BK steps in order).
+
+    The router's weight is the checkpoint's F16 (``moe_router_dtype`` is float32 at training time, half here), and the
+    activation's bf16 has fewer mantissa bits than F16, so casting it up loses nothing while the products stay exact.
+    """
 
     rm = tl.program_id(0) * BM + tl.arange(0, BM)
     re = tl.program_id(1) * BLOCK_E + tl.arange(0, BLOCK_E)
@@ -289,6 +301,8 @@ def _router(X, W, OUT, M, x_stride, D: tl.constexpr, NE: tl.constexpr, BM: tl.co
     acc = tl.zeros((BM, BLOCK_E), dtype=tl.float32)
     for k0 in range(0, D, BK):
         x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
+        if F16:
+            x = x.to(tl.float16)
         w = tl.load(W + re[:, None] * D + (k0 + rk)[None, :], mask=e_ok[:, None], other=0.0)
         acc = tl.dot(x, tl.trans(w), acc)
     tl.store(OUT + rm[:, None] * NE + re[None, :], acc, mask=m_ok[:, None] & e_ok[None, :])
@@ -296,7 +310,7 @@ def _router(X, W, OUT, M, x_stride, D: tl.constexpr, NE: tl.constexpr, BM: tl.co
 
 @triton.jit
 def _router_part(X, W, PART, M, x_stride, D: tl.constexpr, NE: tl.constexpr, BM: tl.constexpr,
-                 BLOCK_E: tl.constexpr, BK: tl.constexpr, KS: tl.constexpr):
+                 BLOCK_E: tl.constexpr, BK: tl.constexpr, KS: tl.constexpr, F16: tl.constexpr):
     """``_router`` over one of KS equal K slices (in order inside the slice): PART[s, m, e] fp32."""
 
     rm = tl.program_id(0) * BM + tl.arange(0, BM)
@@ -309,6 +323,8 @@ def _router_part(X, W, PART, M, x_stride, D: tl.constexpr, NE: tl.constexpr, BM:
     lo = s * (D // KS)
     for k0 in range(lo, lo + D // KS, BK):
         x = tl.load(X + rm[:, None] * x_stride + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
+        if F16:
+            x = x.to(tl.float16)
         w = tl.load(W + re[:, None] * D + (k0 + rk)[None, :], mask=e_ok[:, None], other=0.0)
         acc = tl.dot(x, tl.trans(w), acc)
     tl.store(PART + (s * M + rm[:, None]) * NE + re[None, :], acc, mask=m_ok[:, None] & e_ok[None, :])
@@ -333,15 +349,18 @@ ROUTER_KS = 8
 def router(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
     m, d = x.shape
     ne = w.shape[0]
+    if w.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"router: the weight must be fp16 (the checkpoint's) or bf16, got {w.dtype}")
+    f16 = w.dtype == torch.float16
     bm = 16 if m <= 16 else 32 if m <= 32 else 64 if m <= 64 else 128
     ks = ROUTER_KS
     if ks <= 1 or d % (ks * 64) or not out.is_contiguous():
         _router[(triton.cdiv(m, bm), triton.cdiv(ne, 64))](x, w, out, m, x.stride(0), D=d, NE=ne, BM=bm,
-                                                            BLOCK_E=64, BK=64, num_warps=4, num_stages=3)
+                                                            BLOCK_E=64, BK=64, F16=f16, num_warps=4, num_stages=3)
         return out
     part = torch.empty((ks, m, ne), dtype=torch.float32, device=x.device)
     _router_part[(triton.cdiv(m, bm), triton.cdiv(ne, 32), ks)](x, w, part, m, x.stride(0), D=d, NE=ne, BM=bm,
-                                                                 BLOCK_E=32, BK=64, KS=ks, num_warps=4,
+                                                                 BLOCK_E=32, BK=64, KS=ks, F16=f16, num_warps=4,
                                                                  num_stages=3)
     total = m * ne
     _router_sum[(triton.cdiv(total, 1024),)](part, out, total, KS=ks, BLOCK=1024, num_warps=4)
@@ -407,3 +426,16 @@ def combine(y: torch.Tensor, wts: torch.Tensor, out: torch.Tensor) -> None:
     rows, d = out.shape
     block = min(1024, d)
     _combine[(rows, d // block)](y, wts, out, D=d, SLOTS=wts.shape[1], BLOCK=block, num_warps=4)
+
+
+@triton.jit
+def _mask_routes(PICK, WTS, VALID, N: tl.constexpr, SLOTS: tl.constexpr, EXPERTS: tl.constexpr, BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    invalid = tl.load(VALID + i // SLOTS, mask=i < N, other=0) == 0
+    tl.store(PICK + i, EXPERTS, mask=(i < N) & invalid)
+    tl.store(WTS + i, 0., mask=(i < N) & invalid)
+
+
+def mask_routes(pick, weights, valid, experts):
+    """Padding has no routed members; existing expert kernels still finish their counters normally."""
+    _mask_routes[(triton.cdiv(pick.numel(), 128),)](pick, weights, valid, pick.numel(), pick.shape[1], experts, 128)

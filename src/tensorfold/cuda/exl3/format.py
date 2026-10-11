@@ -384,3 +384,16 @@ def is_exl3(model_dir: str | Path) -> bool:
         return True
     side = root / "quantization_config.json"
     return side.is_file() and str(json.loads(side.read_text()).get("quant_method", "")).lower() == "exl3"
+
+
+def plan_hash(ck: Checkpoint) -> str:
+    """A checkpoint's EXL3 group plan as one hash: every group's name, width, codebook and shape, sorted.
+
+    The tuning manifest records this so a run can tell whether the splits it is about to reuse were measured on the
+    same set of shapes (plan §5.1 item 7); the headers alone are enough, no weight data is read.
+    """
+
+    import hashlib
+
+    lines = sorted(f"{p} {t.bits:g} {t.codebook} {t.k} {t.n}" for p, t in ck.groups.items())
+    return hashlib.sha256("\n".join(lines).encode()).hexdigest()

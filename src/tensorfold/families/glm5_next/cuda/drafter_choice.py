@@ -71,6 +71,8 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
                 m_policy: DepthPolicy, f_policy: DepthPolicy, stop_eos: bool = False, on_tokens=None) -> DecodeResult:
     """Drafted decoding with ``choice`` picking each round's drafter; drafts only propose, so it equals serial."""
 
+    from tensorfold.cuda.streams import accept
+
     w, st, b = e.w, e.st, e.buf
     cap = 256                               # backlog rows a drafter may owe before it absorbs them anyway
     m_rows = torch.empty((cap, w.cfg.hidden), dtype=torch.bfloat16, device=w.device)
@@ -95,7 +97,7 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
         t0 = time.perf_counter()
         if arm == "m":
             backlog = len(m_next)
-            depth = max(1, min(m_policy.next(*last["m"]), room))
+            depth = max(0, min(m_policy.next(*last["m"]), room - 1))
             drafts = draft(e, m_rows[:backlog], m_next, st.pos + 1, depth, sampling, m_policy.confidence)
             steps = 1 + st.mtp_drafted
             m_next = []
@@ -104,8 +106,8 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
             if n_f:
                 drafter.add_taps(f_taps[:n_f])
                 n_f = 0
-            depth = max(1, min(f_policy.next(*last["f"]), room))
-            drafts = drafter.propose(out[-1], depth, sampling, f_policy.confidence)
+            depth = max(0, min(f_policy.next(*last["f"]), room - 1))
+            drafts = drafter.propose(out[-1], depth, sampling, f_policy.confidence) if depth else []
             steps = 0
         t1 = time.perf_counter()
         tokens = e.verify_window([out[-1]] + drafts)
@@ -115,11 +117,10 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
         torch.cuda.synchronize()
         t2 = time.perf_counter()
         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
-        keep = 1
-        for i, d in enumerate(drafts):
-            if sampled[i] != d or (stop_eos and sampled[i] in w.cfg.eos):
-                break
-            keep += 1
+        path, terminal = accept(tokens, list(range(-1, R - 1)), sampled,
+                                count - len(out), w.cfg.eos if stop_eos else ())
+        keep = len(path)
+        new = [tokens[r] for r in path[1:]] + [terminal]
         t3 = time.perf_counter()
         commit(w, st, b, R, keep)
         t4 = time.perf_counter()
@@ -128,7 +129,7 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
             absorb(e, m_rows[:len(m_next)], m_next)
             m_next = []
         m_rows[len(m_next):len(m_next) + keep].copy_(e.main_hidden(slice(0, keep)))
-        m_next.extend(sampled[:keep])
+        m_next.extend(new)
         if drafter is not None:
             if n_f + keep > cap:
                 drafter.add_taps(f_taps[:n_f])
@@ -145,10 +146,10 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
         depths.append(len(drafts))
         keeps.append(keep)
         arms.append(arm)
-        e.follow(sampled[:keep])
-        out.extend(sampled[:keep])
+        e.follow(new)
+        out.extend(new)
         if on_tokens is not None:
-            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
+            on_tokens(new)
         stages["draft"] += (t1 - t0) + (t5 - t4)
         stages["forward"] += t2 - t1
         stages["sample"] += t3 - t2

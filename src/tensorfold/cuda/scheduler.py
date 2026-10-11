@@ -53,6 +53,9 @@ class Scheduler:
         self.waiting = Waiting()
         self.held: tuple | None = None               # a request waiting for memory, admitted before any other
         self.boxes: dict[int, queue.Queue] = {}
+        self._submit_lock = threading.Lock()
+        self._closing = threading.Event()
+        self._stopping = False
         self.yields = 0                              # background streams that gave up their lane
         if hasattr(decoder, "arrived"):              # a decoder filling prompts lets a new request in between passes
             decoder.arrived = self.waiting.foreground
@@ -62,21 +65,28 @@ class Scheduler:
     def close(self) -> None:
         """Stop the worker once idle and let go of the decoder (its thread held it, and its weights, until now)."""
 
-        self.waiting.stop()
+        with self._submit_lock:
+            if not self._closing.is_set():
+                self._closing.set()
+                self.waiting.stop()
         self.thread.join()
         self.decoder = None
 
     def submit(self, prompt: list[int], count: int, sampling: Any, draft: bool,
                emit: Callable[[list[int]], bool | None], stop_eos: bool = True, *, vision: Any = None,
-               constraint: Any = None, background: bool = False, probabilities: Any = None) -> dict:
+               constraint: Any = None, background: bool = False, probabilities: Any = None,
+               options: dict | None = None) -> dict:
         """Decode one request; ``emit`` runs on the calling thread and returns True to stop. Returns its stats."""
 
         box: queue.Queue = queue.Queue()
         stream = Stream(list(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
-                        constraint=constraint, background=background, probabilities=probabilities)
+                        constraint=constraint, background=background, probabilities=probabilities, options=dict(options or {}))
         cancel = [False]
         stream.emit = lambda new: (box.put(("tokens", new)), cancel[0])[1]
-        self.waiting.put((stream, box))
+        with self._submit_lock:
+            if self._closing.is_set():
+                raise RuntimeError("scheduler is closing")
+            self.waiting.put((stream, box))
         while True:
             kind, value = box.get()
             if kind == "tokens":
@@ -94,10 +104,13 @@ class Scheduler:
         for r in requests:
             box: queue.Queue = queue.Queue()
             stream = Stream(list(r["prompt"]), max(1, r["count"]), r["sampling"], draft=r.get("draft", True),
-                            stop_eos=r.get("stop_eos", True), probabilities=r.get("probabilities"))
+                            stop_eos=r.get("stop_eos", True), probabilities=r.get("probabilities"), options=dict(r.get("options") or {}))
             stream.emit = lambda new: False
             boxes.append((stream, box))
-        self.waiting.put_many(boxes)
+        with self._submit_lock:
+            if self._closing.is_set():
+                raise RuntimeError("scheduler is closing")
+            self.waiting.put_many(boxes)
         results, error = [], None
         for _, box in boxes:
             while True:
@@ -123,7 +136,11 @@ class Scheduler:
                 (stream, box), self.held = self.held, None
             else:
                 try:
-                    stream, box = self.waiting.get_nowait()
+                    item = self.waiting.get_nowait()
+                    if item is None:
+                        self._stopping = True
+                        break
+                    stream, box = item
                 except queue.Empty:
                     break
             self.boxes[id(stream)] = box
@@ -165,6 +182,8 @@ class Scheduler:
 
     def _loop(self) -> None:
         while True:
+            if self._stopping and not self.decoder.live() and self.held is None:
+                return
             self._yield()
             idle = not self.decoder.live() and self.held is None
             first = self.waiting.get() if idle else None                              # idle: wait for a request

@@ -32,7 +32,8 @@ def timed(name: str):
 def report(tokens: int) -> None:
     if not ENABLED or not totals:
         return
-    total = sum(v for k, v in totals.items() if ":" not in k)          # "dsa: x" parts are inside "dsa (total)"
+    # "dsa: x" parts are inside "dsa (total)", where that marker exists (the plain path has no such wrapper)
+    total = sum(v for k, v in totals.items() if ":" not in k) or sum(totals.values())
     parts = ", ".join(f"{k} {v:.2f}s ({100 * v / total:.0f}%)" for k, v in sorted(totals.items(), key=lambda kv: -kv[1]))
     print(f"[tensorfold] prefill profile, {tokens} tokens in {total:.1f}s timed ({tokens / total:.0f} tok/s): {parts}",
           flush=True)

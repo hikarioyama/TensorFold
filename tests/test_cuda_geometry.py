@@ -160,6 +160,7 @@ def test_mla_actual_cache_and_replay_state_are_budgeted(monkeypatch, allocations
     cfg = SimpleNamespace(heads=8, lin_heads=8, conv=4, qk_dim=256, v_dim=256, index_dim=128,
                           hidden=512, streams=4, q_lora=512, kv_lora=512, index_heads=32,
                           dense_width=1024, top_k=2, moe_width=512, experts=8, quant="mlx")
+    cfg.qk_rope, cfg.kv_a_width, cfg.full = 0, cfg.kv_lora, False     # Flash: NoPE MLA, no EXL3-everywhere
     layers = [SimpleNamespace(index=i, kind="kda" if i % 2 == 0 else "dsa",
                               kda=SimpleNamespace(proj=SimpleNamespace(n=3 * 4 * 128 + 256 + 4))) for i in range(4)]
     weights = SimpleNamespace(cfg=cfg, world=2, device="cpu", layers=layers, meta={"long_context": True},
@@ -192,6 +193,7 @@ def test_mla_prompt_chunk_latent_partials_hold_one_row_block(monkeypatch, alloca
     cfg = SimpleNamespace(heads=64, lin_heads=8, conv=4, qk_dim=256, v_dim=256, index_dim=128, hidden=512, streams=4,
                           q_lora=512, kv_lora=512, index_heads=32, dense_width=1024, top_k=2, moe_width=512, experts=8,
                           quant="mlx")
+    cfg.qk_rope, cfg.kv_a_width, cfg.full = 0, cfg.kv_lora, False     # Flash: NoPE MLA, no EXL3-everywhere
     layers = [SimpleNamespace(index=i, kind="kda" if i % 2 == 0 else "dsa",
                               kda=SimpleNamespace(proj=SimpleNamespace(n=3 * 4 * 128 + 256 + 4))) for i in range(4)]
     weights = SimpleNamespace(cfg=cfg, world=2, device="cpu", layers=layers, meta={}, mtp=None,
@@ -257,6 +259,7 @@ def test_mla_exl3_scratch_and_buffers_are_budgeted(monkeypatch, allocations, mtp
     cfg = SimpleNamespace(heads=64, lin_heads=64, conv=4, qk_dim=256, v_dim=256, index_dim=128, hidden=4096,
                           streams=4, q_lora=1536, kv_lora=512, index_heads=32, dense_width=12288, top_k=8,
                           moe_width=2048, shared_width=2048, experts=288, quant="exl3")
+    cfg.qk_rope, cfg.kv_a_width, cfg.full = 0, cfg.kv_lora, False     # Flash: NoPE MLA, no EXL3-everywhere
     layers = [SimpleNamespace(index=i, kind="kda" if i % 2 == 0 else "dsa",
                               kda=SimpleNamespace(proj=SimpleNamespace(n=3 * 32 * 128 + 256 + 32))) for i in range(4)]
     weights = SimpleNamespace(cfg=cfg, world=2, device="cpu", layers=layers, meta={"long_context": True},
