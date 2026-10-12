@@ -18,7 +18,7 @@ from tensorfold.cuda.capacity import available_bytes
 from tensorfold.cuda.memory_gate import MemoryGate, NoRoom, torch_live
 from tensorfold.cuda.streams import PrefixCache, Stream, accept, next_fill
 from tensorfold.engine.exact_sampling import Sampling
-from . import decode as dec, engine as engine_cfg, forward as fw, graphs as graph_mod, segmented as seg
+from . import cache_fp8, decode as dec, engine as engine_cfg, forward as fw, graphs as graph_mod, segmented as seg
 from .engine import _f64_ints, _ints_f64, decode_policy, encode_policy
 
 ADMIT, ROUND, FINISH, DROP, STOP, SCORE = range(1, 7)
@@ -38,7 +38,8 @@ def state_bytes(w, capacity):
     c = w.cfg
     layers = len(w.layers) + int(w.mtp is not None)
     owners = len(set(w.meta.get("index_source", ()))) + int(w.mtp is not None)
-    per = layers * (c.kv_lora + c.qk_rope) * 2
+    dtype = w.meta.get("kv_dtype", "bf16")
+    per = layers * (cache_fp8.row_bytes(c.kv_lora, dtype) + cache_fp8.row_bytes(c.qk_rope, dtype))
     if w.meta.get("long_context"):
         per += owners * (c.index_dim * 2 + c.index_heads * 4)
     return capacity * per + 8  # position scalars; full GLM has no recurrent state

@@ -150,7 +150,7 @@ def kernel_namespace(runtime: str) -> list[int]:
     digest = hashlib.sha256()
     here = Path(__file__).parent
     shared = here.parents[2] / "cuda" / "exl3"
-    files = [here / n for n in ("engine.py", "decode.py", "graphs.py", "forward.py", "latent.py", "segmented.py", "sparse53.py", "glue.py", "multi.py", "weights53.py", "qmm.py", "mtp.py")]
+    files = [here / n for n in ("engine.py", "cache_fp8.py", "decode.py", "graphs.py", "forward.py", "latent.py", "segmented.py", "sparse53.py", "glue.py", "multi.py", "weights53.py", "qmm.py", "mtp.py")]
     files += sorted(p for p in shared.iterdir() if p.suffix in (".cu", ".cuh", ".cpp", ".py"))
     files += [shared.parent / "sampling.py", here.parents[2] / "engine" / "exact_sampling.py"]
     # Use the parsed module settings, not an environment that could change after import.
@@ -176,7 +176,7 @@ class GlmEngine:
 
     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
                  drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None, serial_only: bool = False, comm=None,
-                 prefill_rows: int | None = None, world: int = 2, parallel: int = 1) -> None:
+                 prefill_rows: int | None = None, world: int = 2, parallel: int = 1, kv_dtype: str = "bf16") -> None:
         """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between two machines (tests)."""
 
         import torch
@@ -192,6 +192,9 @@ class GlmEngine:
         if not 1 <= int(parallel) <= 4:
             raise ValueError("GLM --parallel must be in 1..4")
         self.parallel = int(parallel)
+        if kv_dtype not in ("bf16", "fp8"):
+            raise ValueError("GLM KV dtype must be bf16 or fp8")
+        self.kv_dtype = kv_dtype
         encode_policy(policy)                           # a bad default fails here, not in the first request
         torch.cuda.set_device(0)
         self.torch = torch
@@ -219,6 +222,11 @@ class GlmEngine:
         explicit = context is not None if context_explicit is None else bool(context_explicit)
         from . import LATENT
 
+        if kv_dtype == "fp8" and not (self.full and LATENT):
+            raise ValueError("FP8 KV cache requires full GLM latent attention")
+
+        prefill_rows = (128 if self.parallel > 1 else PREFILL_ROWS) if prefill_rows is None else int(prefill_rows)
+
         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
         weights_estimate = split_weights(weights_rule, self.world, draft_head=not self.full)
@@ -226,7 +234,8 @@ class GlmEngine:
             weights_estimate = without_mtp(weights_estimate, cfg.layers, self.full)
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
                                    lambda text: mla_geometry(text, self.world, MAX_ROWS, minimum_slots=DENSE_CAPACITY,
-                                                             latent=LATENT, mtp=self.mtp_on),
+                                                             latent=LATENT, mtp=self.mtp_on, kv_dtype=kv_dtype,
+                                                             prefill_rows=prefill_rows if kv_dtype == "fp8" else PREFILL_ROWS),
                                    weights_estimate, rank=rank, world=self.world, gather=self._gather_ints,
                                    draft_dir=drafter, draft_weights=lambda d: dflash2_weights(d, self.world),
                                    draft_geometry=lambda text: dflash2_geometry(text, self.world, MAX_ROWS, ring=DRAFT_RING))
@@ -234,9 +243,8 @@ class GlmEngine:
         capacity = self.capacity_plan["cache_slots"]
         long_context = self.limit > cfg.dense_limit
         # both ranks must run the same calls: refuse to start when they were given different settings
-        prefill_rows = (128 if self.parallel > 1 else PREFILL_ROWS) if prefill_rows is None else int(prefill_rows)
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(LATENT),
-                prefill_rows, int(self.mtp_on), int(DRAFT_RING), self.parallel]
+                prefill_rows, int(self.mtp_on), int(DRAFT_RING), self.parallel, int(kv_dtype == "fp8")]
         # Refuse mixed Python/kernel arithmetic revisions before loading any weights.
         mine += kernel_namespace(torch.__version__)
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
@@ -267,6 +275,10 @@ class GlmEngine:
         self.comm.ready("loading")                   # a peer stuck loading is named, not waited on in NCCL
         self.comm.barrier()
         self.w = w
+        w.meta["kv_dtype"] = kv_dtype
+        self.capacity_plan["kv_dtype"] = kv_dtype
+        if rank == 0:
+            print(f"[tensorfold] MLA KV cache: {kv_dtype}; FP8 uses E4M3FN + FP32 scale per row; index keys FP16", flush=True)
         if rank == 0 and cfg.mtp_layers and not self.mtp_on:
             print("[tensorfold] the checkpoint's MTP head is not loaded (TF_GLM_MTP=" +
                   (os.environ.get("TF_GLM_MTP", "").strip() or MTP_DEFAULT) + "): " +

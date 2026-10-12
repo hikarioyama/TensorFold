@@ -201,8 +201,7 @@ export OMP_NUM_THREADS=4 MAX_JOBS=3
 export NCCL_P2P_LEVEL=SYS
 
 # GLM-5.3 family paths exercised during development
-export TF_GLM_MAIN_PAD=1
-export TF_GLM_CONTROL_FRAME=1
+export TF_GLM_MAIN_PAD=1export TF_GLM_CONTROL_FRAME=1
 export TF_GLM_GRAPH_MISS_MODE=once
 export TF_GLM_SAMPLING_GRAPH=1 TF_GLM_BATCH_SAMPLING=1
 export TF_GLM_ROUTE_MODE=ballot
@@ -216,6 +215,11 @@ export TF_GLM_INPLACE_GATHER=1
 export TF_GLM_EXPERT_TILE=nt4_at8
 
 export TF_NUCLEUS_AMAX=1 TF_NUCLEUS_UNSORTED=1 TF_NUCLEUS_SINGLETON=1
+
+# KV cache: bf16 (default) or fp8. FP8 holds E4M3FN codes with one FP32 scale a row and
+# roughly halves the cache, which is what lets a wide window fit on four cards.
+# It changes the model's numerics; see section 8.
+#   tensorfold serve MODEL --backend cuda --tp 4 ... --kv-dtype fp8
 ```
 
 These are **experimental selectors**, left default-off or legacy-on in the code.
@@ -223,7 +227,8 @@ Enabling them is a deliberate choice, not a supported default.
 `TF_GLM_EXPERT_TILE=nt4_at8` and `TF_GLM_INPLACE_GATHER=1` change kernel dispatch
 and collective behavior; verify correctness on your checkpoint before relying on
 them. Do not mix a native NCCL size tuner into a run unless it was rebuilt for
-your exact NCCL version.
+your exact NCCL version. `--kv-dtype` is accepted by full GLM-5.3 only; Flash
+serves bf16.
 
 ## 8. Scope and non-claims
 
@@ -233,7 +238,13 @@ your exact NCCL version.
 - Abnormal-failure injection for the NCCL path (rank delay, OOM rollback, fatal
   timeout) was not completed.
 - Long-context quality was not evaluated; only capacity and rate were measured.
-- The FP8 KV cache path is not included in this tree.
+- The FP8 KV cache (`--kv-dtype fp8`) **changes the model's numerics**: the latent and
+  rotary caches hold E4M3FN codes with one FP32 scale a row, so attention reads a quantized
+  key and value, and exactness is then relative to the FP8 serial run rather than to bf16. It
+  is opt-in and off by default. It has **not** been A/B'd against bf16 on the same natural
+  text, so its effect on quality is not measured here and no quality-equivalence claim is
+  made. Index keys stay FP16. `CONTRIBUTING.md` asks for an issue before a precision mode
+  that a checkpoint format defines; this is such a mode.
 
 If you need a performance receipt for your own hardware, measure against your
 own checkpoint and publish the receipt with platform, library versions and

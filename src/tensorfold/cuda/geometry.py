@@ -257,8 +257,12 @@ def exl3_expert_scratch(rows: int, slots: int, d: int, width: int) -> int:
 
 
 def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560, latent: bool = False,
-                 mtp: bool | None = None) -> Geometry:
+                 mtp: bool | None = None, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS) -> Geometry:
     """GLM's engine; ``mtp``: whether it holds the MTP head's caches and buffers (None: when the checkpoint has one)."""
+    if kv_dtype not in ("bf16", "fp8") or (kv_dtype == "fp8" and not (latent and t.get("model_type") == "glm_moe_dsa")):
+        raise ValueError("FP8 cache geometry requires full GLM latent attention")
+    if prefill_rows < 1:
+        raise ValueError("prefill_rows must be positive")
     linear, attention = layer_counts(t)
     lin = t.get("linear_attn_config") or {}
     heads = int(t["num_attention_heads"]) // world
@@ -284,25 +288,25 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
         extent += topk * 4 + int(t.get("index_n_heads", 32)) * 4
     fixed += (2 if mtp else 1) * (16 * rows * extent * 4 + 8 * rows * 16384 * 4)
     # prompt-chunk buffers: at most 5 row extents a row without the head
-    fixed += PREFILL_ROWS * 5 * (extent - int(t["vocab_size"]) // world)
+    fixed += prefill_rows * 5 * (extent - int(t["vocab_size"]) // world)
     if full:
-        fixed += PREFILL_ROWS * topk * 4
+        fixed += prefill_rows * topk * 4
     if (t.get("_quantization") or {}).get("quant_method") == "exl3":
         # EXL3 experts' scratch (decode windows, the MTP head's, a prompt chunk) and the prompt's BF16 split-K partials
         fixed += (2 if mtp else 1) * exl3_expert_scratch(rows, slots, d, width)
-        fixed += exl3_expert_scratch(PREFILL_ROWS, slots, d, width) + 8 * PREFILL_ROWS * 16384 * 4
+        fixed += exl3_expert_scratch(prefill_rows, slots, d, width) + 8 * prefill_rows * 16384 * 4
     count = attention + int(mtp)
     lw = int(t.get("kv_lora_rank", 512))
     def bytes_at(capacity: int) -> int:
-        scratch = mla_chunk_scratch(t, world, capacity, latent=latent)
+        scratch = mla_chunk_scratch(t, world, capacity, latent=latent, prefill_rows=prefill_rows)
         rope = int(t.get("qk_rope_head_dim", 0))
         if latent:
             # latent cache (and full GLM-5.3's shared rotary key part beside it); a prompt chunk's partials
             # (MLA_PROMPT_ATT_ROWS rows at a time) and absorbed rows (MTP's too)
-            cache = count * capacity * (lw + rope) * 2
-            dense = min(capacity, minimum_slots) + PREFILL_ROWS
-            scratch += (((dense + 511) // 512) * min(PREFILL_ROWS, MLA_PROMPT_ATT_ROWS) * heads * (lw + 2) * 4
-                        + 4 * PREFILL_ROWS * heads * lw)
+            cache = count * capacity * ((lw + rope) * 2 if kv_dtype == "bf16" else lw + rope + 8)
+            dense = min(capacity, minimum_slots) + prefill_rows
+            scratch += (((dense + 511) // 512) * min(prefill_rows, MLA_PROMPT_ATT_ROWS) * heads * (lw + 2) * 4
+                        + 4 * prefill_rows * heads * lw)
             if full:                           # one owner in four holds a plane; the others hold none
                 owners = sum(1 for k in (t.get("indexer_types") or []) if k == "full") + int(mtp)
                 cache += owners * capacity * (index * 2 + int(t.get("index_n_heads", 32)) * 4)
@@ -315,17 +319,17 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
     return Geometry(bytes_at, reserve, minimum_slots)
 
 
-def mla_chunk_scratch(t: dict, world: int, capacity: int, *, latent: bool) -> int:
+def mla_chunk_scratch(t: dict, world: int, capacity: int, *, latent: bool, prefill_rows: int = PREFILL_ROWS) -> int:
     """A prompt chunk's transient bytes: token selection (fp32 pool scores, chosen pools, token lists), then sparse attention's partials."""
 
     heads, topk = int(t["num_attention_heads"]) // world, int(t.get("index_topk", 2048))
     if str(t.get("model_type") or "") == "glm_moe_dsa":     # the per-token selector's fp32 scores and token lists
-        select = min(PREFILL_ROWS, 32) * 4 * capacity + PREFILL_ROWS * 4 * topk
+        select = min(prefill_rows, 32) * 4 * capacity + prefill_rows * 4 * topk
     else:
         # the fp32 pool scores of at most MLA_SELECT_ROWS rows at once, the chosen pools and token lists of the chunk's
-        select = min(PREFILL_ROWS, MLA_SELECT_ROWS) * 4 * ((capacity + 3) // 4) + PREFILL_ROWS * 16 * (topk + 3)
+        select = min(prefill_rows, MLA_SELECT_ROWS) * 4 * ((capacity + 3) // 4) + prefill_rows * 16 * (topk + 3)
     if latent:
-        return select + ((topk + 515) // 512) * PREFILL_ROWS * heads * (int(t.get("kv_lora_rank", 512)) + 2) * 4
+        return select + ((topk + 515) // 512) * prefill_rows * heads * (int(t.get("kv_lora_rank", 512)) + 2) * 4
     kd = int(t["qk_nope_head_dim"]) + int(t.get("qk_rope_head_dim", 0))
     return select + 128 * heads * (kd + 2) * 4 * ((topk + 515) // 512)
 

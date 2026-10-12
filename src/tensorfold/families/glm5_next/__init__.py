@@ -19,6 +19,7 @@ KERNEL_DEPENDENCIES = ("tensorfold.kernels.qwen.flash_next.v1.prefill_mm",)
 KERNEL_VERSION = "v1"
 # the storage formats each engine reads: MLX affine on a Mac; that or EXL3 routed experts on CUDA
 QUANT_METHODS = {"mlx": ("mlx",), "cuda": ("mlx", "exl3")}
+CUDA_KV_DTYPES = ("bf16", "fp8")  # FP8: full glm_moe_dsa latent cache only
 CUDA_TP4 = True                    # --tp 4: the CUDA engine splits over four ranks
 # the EXL3 variant the CUDA kernels read (4-bit trellis, the "mcg" codebook, routed experts only)
 EXL3_VARIANT = {"bits": 4, "codebook": "mcg", "scope": "glm53_routed_experts_only"}
@@ -239,6 +240,9 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
     """Build the multi-rank engine with MTP drafting, reusable prompt state, or serial decoding when drafts are off."""
 
     full = _is_full(model_dir)
+    kv_dtype = options.get("kv_dtype", "bf16")
+    if kv_dtype not in CUDA_KV_DTYPES or (kv_dtype != "bf16" and not full):
+        raise ValueError("FP8 KV cache is supported only by full GLM-5.3, not Flash")
     if full:
         # CUDA auto remains one; explicit parallel uses the shared Scheduler adapter.
         parallel = options.get("parallel", 1)
@@ -262,7 +266,7 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
         return GlmEngine(Path(model_dir), rank=int(rank), master=master or "127.0.0.1", port=int(master_port),
                          policy=policy, drafter=None, context=options.get("context"),
                          context_explicit=options.get("context_explicit"), serial_only=bool(no_drafts),
-                         world=int(tp), parallel=parallel)
+                         world=int(tp), parallel=parallel, kv_dtype=kv_dtype)
     if int(tp) not in (2, 4):
         raise ValueError("GLM-5.3-Flash needs two GPUs, one per machine: run the same `tensorfold serve` command "
                          "with --tp 2/4 --rank R --master ADDRESS on both (non-zero ranks first)")

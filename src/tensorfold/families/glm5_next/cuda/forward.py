@@ -17,7 +17,7 @@ from tensorfold.cuda.exl3.linear import Exl3Linear
 from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
 from tensorfold.cuda.kernels import prefill_attention, qmm as shared
 
-from . import exl3_generic, glue, kda as kda_mod, latent, prof, qmm, rope, sparse, sparse53
+from . import cache_fp8, exl3_generic, glue, kda as kda_mod, latent, prof, qmm, rope, sparse, sparse53
 from .attention import AttnScratch, attention, kv_write
 from .weights import LayerW, Weights
 from .weights53 import Concat
@@ -266,10 +266,16 @@ class State:
         self.scratch_set = kda_mod.KDAScratchSet(n, rows, LL, dev) if n else None
         self.scratch = self.scratch_set.views if n else []
         self.latent = latent.ENABLED
+        self.kv_dtype = w.meta.get("kv_dtype", "bf16")
+        if self.kv_dtype != "bf16" and not (c.full and self.latent):
+            raise ValueError("FP8 KV cache requires full GLM latent attention")
+        cache_fp8.row_bytes(c.kv_lora, self.kv_dtype)
         if self.latent:              # one 512-wide latent a token and layer (kc), no separate values (vc)
-            self.kc = [torch.zeros((capacity, c.kv_lora), dtype=torch.bfloat16, device=dev) for _ in dsa_layers]
+            self.kc = [(cache_fp8.allocate(capacity, c.kv_lora, dev, self.kv_dtype) if self.kv_dtype == "fp8" else
+                       torch.zeros((capacity, c.kv_lora), dtype=torch.bfloat16, device=dev)) for _ in dsa_layers]
             # the shared rotary key part, one 64-wide row atoken, beside each layer's latents
-            self.kpe = [torch.zeros((capacity, max(c.qk_rope, 1)), dtype=torch.bfloat16, device=dev)
+            self.kpe = [(cache_fp8.allocate(capacity, max(c.qk_rope, 1), dev, self.kv_dtype) if self.kv_dtype == "fp8" else
+                        torch.zeros((capacity, max(c.qk_rope, 1)), dtype=torch.bfloat16, device=dev))
                         for _ in dsa_layers]
             self.vc = [None for _ in dsa_layers]
         else:
@@ -279,8 +285,10 @@ class State:
         self.mtp_drafted = 0
         if w.mtp is not None:
             if self.latent:
-                self.mtp_kc = torch.zeros((capacity, c.kv_lora), dtype=torch.bfloat16, device=dev)
-                self.mtp_kpe = torch.zeros((capacity, max(c.qk_rope, 1)), dtype=torch.bfloat16, device=dev)
+                self.mtp_kc = (cache_fp8.allocate(capacity, c.kv_lora, dev, self.kv_dtype) if self.kv_dtype == "fp8" else
+                       torch.zeros((capacity, c.kv_lora), dtype=torch.bfloat16, device=dev))
+                self.mtp_kpe = (cache_fp8.allocate(capacity, max(c.qk_rope, 1), dev, self.kv_dtype) if self.kv_dtype == "fp8" else
+                        torch.zeros((capacity, max(c.qk_rope, 1)), dtype=torch.bfloat16, device=dev))
                 self.mtp_vc = None
             else:
                 self.mtp_kc = torch.zeros((capacity, HL, c.qk_dim), dtype=torch.bfloat16, device=dev)
@@ -656,17 +664,18 @@ def _dsa_latent_context(a, w: Weights, layer: LayerW, lc: torch.Tensor, kc: torc
                             qpe=s.qpe[:R] if c.qk_rope else None, kpe=kc if c.qk_rope else None)
     if sparse_rows:
         if c.full:
-            # An eager prompt pass carries no captured bucket, and a None bucket makes select_tokens score the
-            # whole key plane: a 43K-token prompt at a 256K window then scores 256K entries a row, and the
-            # selection alone measured ~18s of a 79s 43K-token prefill. Size the pass to the rows' own visible
-            # range instead. score_bucket() rounds up to a power of two so a captured graph is reused across
-            # nearby positions; eager has no graph, so the exact scoring tile is used and up to half the scan
-            # is not paid. Entries past a row are masked to -inf and the scan is never narrower than k, so the
-            # selected top-k is identical either way (verified against the same checkpoint's outputs).
+            # An eager prefill has no captured bucket, and a None bucket makes select_tokens score the whole
+            # key plane: a 43K prompt at a 256K window then scores 256K entries a row, which is what made
+            # prefill crawl (~450 tok/s). Size the pass to the rows' own visible range instead.
+            # score_bucket() rounds up to a power of two so a captured graph is reused across nearby
+            # positions; eager has no graph, so the exact scoring tile is used and up to half the scan is
+            # not paid. Entries past a row are masked to -inf and the scan is never narrower than k, so the
+            # selected top-k is identical either way.
             sel_bucket = sparse_np
             if sel_bucket is None and host_pos is not None:
                 plane = min(b.sel_np, int(index[0].shape[0]))
-                tile = -(-(host_pos + R) // sparse53.SEL_BN) * sparse53.SEL_BN
+                span = host_pos + R
+                tile = -(-span // sparse53.SEL_BN) * sparse53.SEL_BN
                 sel_bucket = min(plane, max(tile, sparse53.SEL_BN, c.index_topk))
             with prof.timed("dsa: select tokens"):
                 tokens, counts = _selection(a, w, layer, index, b, R, pos_dev, sel_bucket, prepared)
