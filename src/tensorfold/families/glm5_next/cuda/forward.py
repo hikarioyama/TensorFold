@@ -656,7 +656,20 @@ def _dsa_latent_context(a, w: Weights, layer: LayerW, lc: torch.Tensor, kc: torc
                             qpe=s.qpe[:R] if c.qk_rope else None, kpe=kc if c.qk_rope else None)
     if sparse_rows:
         if c.full:
-            tokens, counts = _selection(a, w, layer, index, b, R, pos_dev, sparse_np, prepared)
+            # An eager prompt pass carries no captured bucket, and a None bucket makes select_tokens score the
+            # whole key plane: a 43K-token prompt at a 256K window then scores 256K entries a row, and the
+            # selection alone measured ~18s of a 79s 43K-token prefill. Size the pass to the rows' own visible
+            # range instead. score_bucket() rounds up to a power of two so a captured graph is reused across
+            # nearby positions; eager has no graph, so the exact scoring tile is used and up to half the scan
+            # is not paid. Entries past a row are masked to -inf and the scan is never narrower than k, so the
+            # selected top-k is identical either way (verified against the same checkpoint's outputs).
+            sel_bucket = sparse_np
+            if sel_bucket is None and host_pos is not None:
+                plane = min(b.sel_np, int(index[0].shape[0]))
+                tile = -(-(host_pos + R) // sparse53.SEL_BN) * sparse53.SEL_BN
+                sel_bucket = min(plane, max(tile, sparse53.SEL_BN, c.index_topk))
+            with prof.timed("dsa: select tokens"):
+                tokens, counts = _selection(a, w, layer, index, b, R, pos_dev, sel_bucket, prepared)
         else:
             with prof.timed("dsa: select tokens"):
                 mm(b, b.qr[:R], ix.qb, sums(w, b.xs_qr[:R]), b.qi[:R])
