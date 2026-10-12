@@ -47,13 +47,14 @@ def test_fp8_not_accepted_for_flash_or_expanded_geometry():
             mla_geometry(text, 4, 8, latent=latent, kv_dtype="fp8")
 
 
-def test_family_passes_explicit_dtype_and_preserves_default(monkeypatch, tmp_path):
+def test_family_passes_explicit_dtype_and_defaults_full_to_fp8(monkeypatch, tmp_path):
     from tensorfold.families import glm5_next as family
     from tensorfold.families.glm5_next.cuda import engine
     (tmp_path / "config.json").write_text(json.dumps(config()))
     monkeypatch.setattr(engine, "GlmEngine", lambda *a, **kw: kw)
     assert family.cuda_engine(tmp_path, tp=4, master="127.0.0.1", kv_dtype="fp8")["kv_dtype"] == "fp8"
-    assert family.cuda_engine(tmp_path, tp=4, master="127.0.0.1")["kv_dtype"] == "bf16"
+    assert family.cuda_engine(tmp_path, tp=4, master="127.0.0.1", kv_dtype="bf16")["kv_dtype"] == "bf16"
+    assert family.cuda_engine(tmp_path, tp=4, master="127.0.0.1")["kv_dtype"] == "fp8"   # full GLM defaults to fp8
     (tmp_path / "config.json").write_text(json.dumps(dict(config(), model_type="glm5_next")))
     with pytest.raises(ValueError, match="only by full"):
         family.cuda_engine(tmp_path, tp=4, master="127.0.0.1", kv_dtype="fp8")

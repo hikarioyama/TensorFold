@@ -46,6 +46,8 @@ GLM-5.3-Flash images run on MLX; dense Qwen's run on MLX and CUDA. See
 
 `tensorfold models` lists families and checkpoints. `tensorfold info MODEL` checks configuration without
 fetching weights. `serve` downloads a missing checkpoint; `pull` downloads it ahead of time.
+Full GLM-5.3 serves an fp8 MLA cache by default (`--kv-dtype bf16` for the unquantized one); see
+[GLM53-TP4.md](GLM53-TP4.md).
 Those `TensorFold/...` ids moved from the `Vontra` org on Hugging Face on 2 October 2026; the old names redirect.
 
 ```bash
@@ -124,7 +126,7 @@ between MLX and CUDA, different quantizations, or different tensor-parallel rank
 | `--no-drafts` | Decode serially | Both |
 | `--drafter auto`, `none`, or model ID | Select an optional draft model where the family supports it | Both |
 | `--mtp-drafts N` | Family-specific cap on MTP drafts | Both |
-| `--kv-dtype bf16`, `int8`, `int4` | Flash Next: `int8` or `int4` stores keys and values with one fp16 scale per 32 values. Other families and the MLX path refuse it | CUDA |
+| `--kv-dtype fp8` (default for full GLM-5.3), `bf16`, `int8`, `int4` | `fp8` stores full GLM-5.3's MLA latent and rotary cache as E4M3FN codes with one fp32 scale a row (index keys stay fp16), under half a bf16 row, which is what a wide window costs. Flash Next: `int8` or `int4` stores keys and values with one fp16 scale per 32 values. Other families and the MLX path refuse it | CUDA |
 | `--mtp-confidence P` | Flash Next: stop a draft chain before a later draft under this probability, 0 to 1 (default 0.70) | CUDA |
 | `--prefill-fp8` | Prompt matmuls take FP8 (e4m3) activations, one scale a row, where the checkpoint has an FP8 prompt kernel (Qwen3.8 27B and Qwen3.6 MLX 4-bit, FP8 and MXFP8 layers of NVFP4 checkpoints): faster prompts at lower precision ([measured](docs/recipes/cuda.md#prompt-precision)). Default: bf16 activations, as decode | CUDA |
 | `--precision checkpoint`, `full` | NVFP4 checkpoints: `checkpoint` (default) runs their own math, FP4 x FP4 on SM 12.x and FP8 x FP8 from 8.9, W4A16 elsewhere; `full` runs bf16 activations against the stored weights ([measured](docs/recipes/cuda.md#nvfp4-precision)) | CUDA |

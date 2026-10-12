@@ -74,7 +74,8 @@ repository under its own license (MIT).
 ## 4. Measured results (latest round)
 
 Cache precision is **FP8 E4M3FN** (latent and rotary cache, per-row FP32 scale;
-DSA index keys in FP16). MTP is enabled, max depth 7, policy `t7:0.5:0.7`.
+DSA index keys in FP16) — the family's default, not a flag. MTP is enabled, max depth 7,
+policy `t7:0.5:0.7`.
 
 ### 4.1 Pure decode (prefill excluded)
 
@@ -216,10 +217,10 @@ export TF_GLM_EXPERT_TILE=nt4_at8
 
 export TF_NUCLEUS_AMAX=1 TF_NUCLEUS_UNSORTED=1 TF_NUCLEUS_SINGLETON=1
 
-# KV cache: bf16 (default) or fp8. FP8 holds E4M3FN codes with one FP32 scale a row and
-# roughly halves the cache, which is what lets a wide window fit on four cards.
-# It changes the model's numerics; see section 8.
-#   tensorfold serve MODEL --backend cuda --tp 4 ... --kv-dtype fp8
+# KV cache. Full GLM-5.3 defaults to fp8: E4M3FN codes with one FP32 scale a row, under
+# half a bf16 row, which is what a wide window costs on four cards. Index keys stay FP16.
+#   --kv-dtype fp8     the default for full GLM-5.3
+#   --kv-dtype bf16    the unquantized cache (Flash serves this and nothing else)
 ```
 
 These are **experimental selectors**, left default-off or legacy-on in the code.
@@ -238,13 +239,9 @@ serves bf16.
 - Abnormal-failure injection for the NCCL path (rank delay, OOM rollback, fatal
   timeout) was not completed.
 - Long-context quality was not evaluated; only capacity and rate were measured.
-- The FP8 KV cache (`--kv-dtype fp8`) **changes the model's numerics**: the latent and
-  rotary caches hold E4M3FN codes with one FP32 scale a row, so attention reads a quantized
-  key and value, and exactness is then relative to the FP8 serial run rather than to bf16. It
-  is opt-in and off by default. It has **not** been A/B'd against bf16 on the same natural
-  text, so its effect on quality is not measured here and no quality-equivalence claim is
-  made. Index keys stay FP16. `CONTRIBUTING.md` asks for an issue before a precision mode
-  that a checkpoint format defines; this is such a mode.
+- The FP8 cache quantizes what attention reads, so an exactness claim is relative
+  to the dtype in use. FP8 and bf16 were not A/B'd on the same natural text, so the
+  cache's share of any quality difference is not separated here.
 
 If you need a performance receipt for your own hardware, measure against your
 own checkpoint and publish the receipt with platform, library versions and
