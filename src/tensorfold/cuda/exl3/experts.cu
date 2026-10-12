@@ -134,6 +134,94 @@ __global__ void __launch_bounds__(SMALL_GROUP_THREADS) group_ballot_kernel(
     }
 }
 
+// Large stable route plan, phase 1: discover experts once, then compact IDs.
+// Integer atomics mark presence only; their order cannot affect IDs or members.
+// Unlike group_kernel, no thread serially scans every pick for each expert.
+__global__ void __launch_bounds__(GROUP_THREADS) group_ids_kernel(
+    const int* __restrict__ pick, int* __restrict__ uids, int* __restrict__ ucount,
+    int n, int E) {
+    __shared__ int present[GROUP_THREADS * GROUP_PER_THREAD];
+    __shared__ int warp_tot[GROUP_THREADS / 32];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    for (int e = tid; e < E; e += GROUP_THREADS) present[e] = 0;
+    __syncthreads();
+    for (int base = 0; base < n; base += GROUP_THREADS) {
+        const int p = base + tid, e = p < n ? pick[p] : -1;
+        const unsigned peers = __match_any_sync(0xffffffffu, e);
+        if (e >= 0 && e < E && lane == __ffs(peers) - 1) atomicExch(present + e, 1);
+    }
+    __syncthreads();
+    int used = 0;
+#pragma unroll
+    for (int q = 0; q < GROUP_PER_THREAD; ++q) {
+        const int e = tid * GROUP_PER_THREAD + q;
+        used += e < E ? present[e] : 0;
+    }
+    int inc = used;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int v = __shfl_up_sync(0xffffffffu, inc, o);
+        if (lane >= o) inc += v;
+    }
+    if (lane == 31) warp_tot[warp] = inc;
+    __syncthreads();
+    if (warp == 0) {
+        const int v = warp_tot[lane];
+        int sum = v;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int x = __shfl_up_sync(0xffffffffu, sum, o);
+            if (lane >= o) sum += x;
+        }
+        warp_tot[lane] = sum - v;
+        if (lane == 31) ucount[0] = sum;
+    }
+    __syncthreads();
+    int place = warp_tot[warp] + inc - used;
+#pragma unroll
+    for (int q = 0; q < GROUP_PER_THREAD; ++q) {
+        const int e = tid * GROUP_PER_THREAD + q;
+        if (e < E && present[e]) uids[place++] = e;
+    }
+}
+
+// Phase 2: one CTA per live expert. Ballots compact contiguous 256-pick tiles
+// in row/slot order. No floating arithmetic, global scratch, or host readback.
+// All threads, including tail lanes, participate in every vote and barrier.
+constexpr int PARALLEL_GROUP_THREADS = 256;
+__global__ void __launch_bounds__(PARALLEL_GROUP_THREADS) group_members_kernel(
+    const int* __restrict__ pick, const int* __restrict__ uids,
+    const int* __restrict__ ucount, int* __restrict__ members,
+    int n, int slots, int maxm) {
+    const int place = blockIdx.x;
+    if (place >= ucount[0]) return;
+    const int e = uids[place];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    __shared__ int counts[PARALLEL_GROUP_THREADS / 32];
+    int used = 0;
+    for (int base = 0; base < n && used < maxm; base += PARALLEL_GROUP_THREADS) {
+        const int p = base + tid;
+        const bool hit = p < n && pick[p] == e;
+        const unsigned mask = __ballot_sync(0xffffffffu, hit);
+        if (lane == 0) counts[warp] = __popc(mask);
+        __syncthreads();
+        int before = 0, total = 0;
+#pragma unroll
+        for (int w = 0; w < PARALLEL_GROUP_THREADS / 32; ++w) {
+            const int c = counts[w];
+            if (w < warp) before += c;
+            total += c;
+        }
+        const int at = used + before + __popc(mask & ((1u << lane) - 1));
+        if (hit && at < maxm)
+            members[(size_t)place * maxm + at] = (p / slots) * 32 + p % slots;
+        used += total;
+        __syncthreads();  // do not overwrite counts before every warp has read it
+    }
+    for (int j = used + tid; j < maxm; j += PARALLEL_GROUP_THREADS)
+        members[(size_t)place * maxm + j] = -1;
+}
+
 // Walsh-Hadamard transform of 128 values, 4 a lane, fixed butterfly order (strides 1, 2 in registers, 4..64 across lanes).
 __device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
     float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
@@ -390,6 +478,27 @@ void exl3x_group_ballot_cuda(const at::Tensor& pick, at::Tensor& uids, at::Tenso
         pick.data_ptr<int>(), uids.data_ptr<int>(), ucount.data_ptr<int>(), members.data_ptr<int>(),
         (int)R, (int)slots, (int)E, (int)members.size(1));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Adaptive stable route: keep the measured small-row ballot path, and use
+// bounded shared memory plus independent expert CTAs for larger plans.
+void exl3x_group_parallel_cuda(const at::Tensor& pick, at::Tensor& uids, at::Tensor& ucount,
+                             at::Tensor& members, int64_t R, int64_t slots, int64_t E) {
+    const int n = (int)(R * slots), chunks = (n + 31) / 32;
+    if (R >= 1 && R <= 128 && E <= 256 && (E * chunks + E + 9) * sizeof(int) <= 48 * 1024) {
+        exl3x_group_ballot_cuda(pick, uids, ucount, members, R, slots, E);
+        return;
+    }
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    group_ids_kernel<<<1, GROUP_THREADS, 0, stream>>>(
+        pick.data_ptr<int>(), uids.data_ptr<int>(), ucount.data_ptr<int>(), n, (int)E);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (n > 0) {
+        group_members_kernel<<<(unsigned)std::min<int64_t>(n, E), PARALLEL_GROUP_THREADS, 0, stream>>>(
+            pick.data_ptr<int>(), uids.data_ptr<int>(), ucount.data_ptr<int>(), members.data_ptr<int>(),
+            n, (int)slots, (int)members.size(1));
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
 }
 
 void exl3x_rot_in_cuda(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0,

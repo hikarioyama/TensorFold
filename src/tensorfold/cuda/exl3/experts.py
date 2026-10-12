@@ -149,8 +149,8 @@ class Scratch:
     def __init__(self, ex: Exl3RoutedExperts, rows: int, slots: int, cfg_gu=None, cfg_d=None, device="cuda", grouped_mode: int = 0, route_mode: int = 0) -> None:
         if grouped_mode not in (0, 1, 2, 3):
             raise ValueError("grouped_mode must be in 0..3")
-        if route_mode not in (0, 1):
-            raise ValueError("route_mode must be 0 or 1")
+        if route_mode not in (0, 1, 2):
+            raise ValueError("route_mode must be 0, 1 or 2")
         self.route_mode = route_mode
         self.grouped_mode = grouped_mode
         self.adaptive_tiles = False
@@ -203,7 +203,7 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         raise ValueError(f"{R} rows but the scratch holds {s.rows}")
     ids, members = s.window(R)
     if group:
-        route = ext.group_ballot if s.route_mode else ext.group
+        route = (ext.group, ext.group_ballot, ext.group_parallel)[s.route_mode]
         route(pick, ids, s.count, members, R, slots, E)
     ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
     nt, w, sk, pf = grouped_config(s, s.cfg_gu, R)

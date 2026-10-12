@@ -33,9 +33,9 @@ INPLACE_GATHER = INPLACE_GATHER == "1"
 GROUPED_MODE = os.environ.get("TF_GLM_GROUPED_MODE", "legacy")
 GROUPED_MODES = {"legacy": 0, "swizzle": 1, "smallm": 2, "transpose": 3}
 ROUTE_MODE = os.environ.get("TF_GLM_ROUTE_MODE", "legacy")
-ROUTE_MODES = {"legacy": 0, "ballot": 1}
+ROUTE_MODES = {"legacy": 0, "ballot": 1, "parallel": 2}
 if ROUTE_MODE not in ROUTE_MODES:
-    raise ValueError("TF_GLM_ROUTE_MODE: legacy or ballot")
+    raise ValueError("TF_GLM_ROUTE_MODE: legacy, ballot or parallel")
 if GROUPED_MODE not in GROUPED_MODES:
     raise ValueError("TF_GLM_GROUPED_MODE: legacy, swizzle, smallm or transpose")
 if EXPERT_TILE not in ("baseline", "nt4pf2", "nt4_at8"):
