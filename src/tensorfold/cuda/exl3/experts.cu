@@ -404,7 +404,7 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
                         const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
                         const at::Tensor& members, at::Tensor& Z, int64_t mats, int64_t K, int64_t N, int64_t P,
                         int64_t SK, int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo,
-                        int64_t hi, int64_t mode) {
+                        int64_t hi, int64_t mode, const c10::optional<at::Tensor>& tiles, const c10::optional<at::Tensor>& tile_count) {
     TORCH_CHECK(K % (16 * SK * warps) == 0 && N % (16 * nt) == 0, "K and N must split evenly");
     tf_exl3x::GroupedArgs a;
     a.x0 = reinterpret_cast<const half*>(X0.data_ptr());
@@ -419,6 +419,9 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
     a.z = Z.data_ptr<float>();
     a.K = (int)K; a.N = (int)N; a.P = (int)P; a.SK = (int)SK; a.maxm = (int)members.size(1); a.slots = (int)slots;
     a.nexp_max = (int)uids.size(0);
+    a.tiles = tiles ? tiles->data_ptr<int>() : nullptr;
+    a.tile_count = tile_count ? tile_count->data_ptr<int>() : nullptr;
+    a.tile_capacity = tiles ? (int)tiles->size(0) : 0;
     a.mode = (int)mode;
     a.mats = (int)mats; a.nt = (int)nt; a.warps = (int)warps; a.pf = (int)pf; a.lo = (int)lo; a.hi = (int)hi;
     auto stream = at::cuda::getCurrentCUDAStream();

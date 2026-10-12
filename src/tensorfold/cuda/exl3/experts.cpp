@@ -6,7 +6,7 @@
 void exl3x_grouped_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                         const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-                        int64_t, int64_t, int64_t);
+                        int64_t, int64_t, int64_t, const c10::optional<at::Tensor>&, const c10::optional<at::Tensor>&);
 void exl3x_dequant_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 void exl3x_group_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
 void exl3x_group_ballot_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
@@ -30,7 +30,8 @@ static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
 void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
              const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
              const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK,
-             int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo, int64_t hi, int64_t mode) {
+             int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo, int64_t hi, int64_t mode,
+             const c10::optional<at::Tensor>& tiles, const c10::optional<at::Tensor>& tile_count) {
     TORCH_CHECK(mode >= 0 && mode <= 3, "grouped mode must be in 0..3");
     check(X0, at::kHalf, "X0");
     check(X1, at::kHalf, "X1");
@@ -44,9 +45,18 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, 
     check(Z, at::kFloat, "Z");
     TORCH_CHECK(Z.numel() >= mats * SK * P * N, "Z too small");
     TORCH_CHECK(X0.numel() >= P * K && X1.numel() >= P * K, "X too small");
+    TORCH_CHECK(bool(tiles) == bool(tile_count), "tiles and tile_count must be provided together");
+    if (tiles) {
+        check(*tiles, at::kInt, "tiles");
+        check(*tile_count, at::kInt, "tile_count");
+        TORCH_CHECK(tiles->device() == X0.device() && tile_count->device() == X0.device(), "tile device mismatch");
+        TORCH_CHECK(tiles->dim() == 2 && tiles->size(1) == 2 && tiles->size(0) >= 1 &&
+                    tiles->size(0) <= INT_MAX && tile_count->numel() == 1, "invalid tile workspace");
+        TORCH_CHECK(members.dim() == 2 && members.size(0) >= uids.numel() && members.size(1) >= 1, "invalid members");
+    }
     c10::cuda::CUDAGuard guard(X0.device());
     exl3x_grouped_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, SK, slots, cb, nt, warps,
-                       pf, lo, hi, mode);
+                       pf, lo, hi, mode, tiles, tile_count);
 }
 
 void dequant(const at::Tensor& T, at::Tensor out, int64_t k2, int64_t cb) {
@@ -174,7 +184,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("members"), pybind11::arg("Z"), pybind11::arg("mats"), pybind11::arg("K"),
           pybind11::arg("N"), pybind11::arg("P"), pybind11::arg("SK"), pybind11::arg("slots"),
           pybind11::arg("cb"), pybind11::arg("nt"), pybind11::arg("warps"), pybind11::arg("pf"),
-          pybind11::arg("lo"), pybind11::arg("hi"), pybind11::arg("mode") = 0);
+          pybind11::arg("lo"), pybind11::arg("hi"), pybind11::arg("mode") = 0,
+          pybind11::arg("tiles") = c10::nullopt, pybind11::arg("tile_count") = c10::nullopt);
     m.def("dequant", &dequant);
     m.def("group", &group);
     m.def("group_ballot", &group_ballot);

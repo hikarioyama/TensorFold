@@ -18,6 +18,32 @@ CHUNK = 512        # keys per chunk program, merged in absolute order
 # at R=1 the grid is (rows, heads / HB, key chunks), and with 16 heads a program a 2,048-token row leaves 4 programs
 # on a 188-SM GPU. 0 keeps ``head_block``'s value; probes sweep it (TF_GLM_SPARSE_HB sets the start value).
 SPARSE_HB = int(os.environ.get("TF_GLM_SPARSE_HB", "4") or 0)   # measured at 2,100 tokens: 8.93 ms vs 10.00 at 16
+MLA_POLICY = os.environ.get("TF_GLM_MLA_POLICY", "legacy")
+if MLA_POLICY not in ("legacy", "decode443"):
+    raise ValueError("TF_GLM_MLA_POLICY: legacy or decode443")
+# Empty/unknown host buckets never select a candidate. This manifest is narrowed
+# to successful full-model cells before deployment; no rank-local autotuning.
+PREFILL_MLA_POLICY = os.environ.get("TF_GLM_PREFILL_MLA_POLICY", "legacy")
+DENSE_POLICY = os.environ.get("TF_GLM_DENSE_POLICY", "legacy")
+if PREFILL_MLA_POLICY not in ("legacy", "prefill1643") or DENSE_POLICY not in ("legacy", "decode443"):
+    raise ValueError("invalid MLA prefill/dense policy")
+PREFILL_MLA_ROWS = (32, 128, 512, 2048)
+PREFILL_MLA_BUCKETS = (4096, 8192, 16384, 32768, 65536, 131072, 229376, 229384)
+MLA_BUCKETS = tuple(int(b) for b in os.environ.get("TF_GLM_MLA_BUCKETS", "8192,16384,32768,65536,131072,229376,229384").split(",") if b)
+
+
+def sparse_launch(rows, heads, width, rope, dtype, selections, bucket):
+    if (PREFILL_MLA_POLICY == "prefill1643" and rows in PREFILL_MLA_ROWS and heads == 16 and width == 512
+            and rope == 64 and dtype == torch.uint8 and selections == 2048 and bucket in PREFILL_MLA_BUCKETS
+            and SPARSE_HB == 4):
+        return 16, 4, 3
+    if (MLA_POLICY == "decode443" and rows in (1, 2) and heads == 16 and width == 512
+            and rope == 64 and dtype == torch.uint8 and selections == 2048 and bucket in MLA_BUCKETS
+            and SPARSE_HB == 4):
+        return 4, 4, 3
+    return (head_block(rows, width) if SPARSE_HB <= 0 else min(SPARSE_HB, heads)), 8, 1
+
+
 KT = 32            # keys per tensor-core tile
 HB = 16            # heads per attention tile (all from one row)
 HB_WIDE = 32       # prefill chunks: a rank's 32 heads in one tile read each key once (same bits as 16, tested)
@@ -403,23 +429,28 @@ def attention(qa: torch.Tensor, cache: torch.Tensor, pos: torch.Tensor, s: Laten
         raise ValueError(f"latent attention: {R} rows, {nch} chunks, width {LW} past the scratch's "
                          f"{s.part_rows}, {s.nch}, {s.lw}")
     n = nch * R * H
-    hb = head_block(R, LW) if hb is None else hb
+    automatic = hb is None
+    hb = head_block(R, LW) if automatic else hb
     if hb not in (HB, HB_WIDE):
         raise ValueError(f"latent attention: {hb} heads a program, not {HB} or {HB_WIDE}")
     rope = 0 if qpe is None else qpe.shape[2]
     if cache.dtype == torch.uint8 and (rope <= 0 or kpe is None or kpe.dtype != torch.uint8):
         raise ValueError("FP8 MLA requires full GLM latent and rotary caches")
+    warps, stages = 8, 1
+    if (automatic and DENSE_POLICY == "decode443" and R in (1, 2) and H == 16 and LW == 512
+            and rope == 64 and cache.dtype == torch.uint8 and nch <= 6):
+        hb, warps, stages = 4, 4, 3
     _dense_chunks[(R, triton.cdiv(H, hb), nch)](qa, cache, s.qpe if qpe is None else qpe,
                                                 s.qpe if kpe is None else kpe, pos, s.po[:n * LW], s.pm[:n],
                                                 s.pl[:n], R, H=H, LW=LW, CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT,
-                                                ROPE=rope, FP8=cache.dtype == torch.uint8, num_warps=8, num_stages=1)
+                                                ROPE=rope, FP8=cache.dtype == torch.uint8, num_warps=warps, num_stages=stages)
     _merge[(R, H)](s.po, s.pm, s.pl, out, s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False, num_warps=4)
     return out
 
 
 def sparse_attention(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor,
                      out: torch.Tensor, scale: float, qpe: torch.Tensor | None = None,
-                     kpe: torch.Tensor | None = None, scratch: LatentScratch | None = None) -> None:
+                     kpe: torch.Tensor | None = None, scratch: LatentScratch | None = None, *, bucket: int | None = None) -> None:
     """Attention of rows with counts > 0 over their selected tokens (ascending, -1 padded), written into out; other rows are left alone."""
     R, H, LW = qa.shape
     W = tokens.shape[1]
@@ -431,15 +462,15 @@ def sparse_attention(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor
         po = torch.empty((n * LW,), dtype=torch.float32, device=qa.device)
         pm = torch.empty((n,), dtype=torch.float32, device=qa.device)
         pl = torch.empty((n,), dtype=torch.float32, device=qa.device)
-    hb = head_block(R) if SPARSE_HB <= 0 else min(SPARSE_HB, H)
     rope = 0 if qpe is None else qpe.shape[2]
+    hb, warps, stages = sparse_launch(R, H, LW, rope, cache.dtype, W, bucket)
     if cache.dtype == torch.uint8 and (rope <= 0 or kpe is None or kpe.dtype != torch.uint8):
         raise ValueError("FP8 MLA requires full GLM latent and rotary caches")
     # No scratch object exists on this path. With ROPE=0 Triton eliminates the rotary loads.
     _sparse_chunks[(R, triton.cdiv(H, hb), nch)](qa, cache, qa if qpe is None else qpe,
                                                  cache if kpe is None else kpe, tokens, counts, po, pm, pl, R,
                                                  W=W, H=H, LW=LW, CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT, ROPE=rope, FP8=cache.dtype == torch.uint8,
-                                                 num_warps=8, num_stages=1)
+                                                 num_warps=warps, num_stages=stages)
     _merge[(R, H)](po, pm, pl, out, counts, R, H=H, LW=LW, NCH=nch, SPARSE=True, num_warps=4)
 
 

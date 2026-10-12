@@ -146,6 +146,7 @@ def kernel_namespace(runtime: str) -> list[int]:
     """Hash effective kernel options and source/ABI before rank-local weight loading."""
     from . import decode, forward as fw, graphs, weights53
     from tensorfold.cuda import sampling as shared_sampling
+    from tensorfold.cuda.exl3 import linear as exl3_linear
 
     digest = hashlib.sha256()
     here = Path(__file__).parent
@@ -154,7 +155,7 @@ def kernel_namespace(runtime: str) -> list[int]:
     files += sorted(p for p in shared.iterdir() if p.suffix in (".cu", ".cuh", ".cpp", ".py"))
     files += [shared.parent / "sampling.py", here.parents[2] / "engine" / "exact_sampling.py"]
     # Use the parsed module settings, not an environment that could change after import.
-    settings = (runtime, shared_sampling.AMAX, shared_sampling.UNSORTED, shared_sampling.SINGLETON, fw.EXPERT_TILE, fw.DOWN_COMBINE, fw.INPLACE_GATHER, fw.GROUPED_MODE, fw.ROUTE_MODE, fw.sparse53.SELECTOR_MODE,
+    settings = (runtime, shared_sampling.AMAX, shared_sampling.UNSORTED, shared_sampling.SINGLETON, fw.EXPERT_TILE, fw.DOWN_COMBINE, fw.INPLACE_GATHER, fw.GROUPED_MODE, fw.ROUTE_MODE, fw.COMPACT_TILES, fw.latent.MLA_POLICY, fw.latent.MLA_BUCKETS, fw.latent.PREFILL_MLA_POLICY, fw.latent.PREFILL_MLA_ROWS, fw.latent.PREFILL_MLA_BUCKETS, fw.latent.DENSE_POLICY, fw.latent.SPARSE_HB, exl3_linear.PAIR_COMPACT, exl3_linear.PREFILL_G2, exl3_linear.G2_ROWS, fw.sparse53.SELECTOR_MODE, fw.sparse53.PREFILL_SELECTOR,
                 weights53.LINEAR_MODE, weights53.CONCAT_DIRECT, weights53.CONCAT_PAIR,
                 decode.NUCLEUS_FALLBACK, decode.NUCLEUS_INITIAL, decode.BATCH_SAMPLING, graphs.PACKED_CACHE_LIMIT, graphs.SAMPLING_GRAPH, graphs.SAMPLING_CACHE_LIMIT, graphs.GRAPH_MISS_MODE, CONTROL_FRAME, MAIN_PAD, GRAPH_ROWS)
     digest.update(repr(settings).encode())

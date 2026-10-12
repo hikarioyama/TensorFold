@@ -31,6 +31,10 @@ INPLACE_GATHER = os.environ.get("TF_GLM_INPLACE_GATHER", "0")
 if INPLACE_GATHER not in ("0", "1"):
     raise ValueError("TF_GLM_INPLACE_GATHER must be 0 or 1")
 INPLACE_GATHER = INPLACE_GATHER == "1"
+COMPACT_TILES = os.environ.get("TF_GLM_COMPACT_TILES", "0")
+if COMPACT_TILES not in ("0", "1"):
+    raise ValueError("TF_GLM_COMPACT_TILES must be 0 or 1")
+COMPACT_TILES = COMPACT_TILES == "1"
 GROUPED_MODE = os.environ.get("TF_GLM_GROUPED_MODE", "legacy")
 GROUPED_MODES = {"legacy": 0, "swizzle": 1, "smallm": 2, "transpose": 3}
 ROUTE_MODE = os.environ.get("TF_GLM_ROUTE_MODE", "legacy")
@@ -133,8 +137,8 @@ class Buffers:
         self.sel_cnt = torch.empty((rows,), dtype=torch.int32, device=dev) if c.full else None
         self.sel_score = (torch.empty((min(rows, self.SEL_SLAB), self.sel_np), dtype=f32, device=dev)
                           if c.full else None)
-        self.sel_parallel = (sparse53.selection_scratch(rows, self.sel_np, dev)
-                             if c.full and not prefill else None)
+        self.sel_parallel = (sparse53.selection_scratch(rows, self.sel_np, dev, prefill=prefill)
+                             if c.full else None)
         self.sel_owner: int | None = None       # the layer whose selection sel_tok/sel_cnt hold
         # dense MLP
         dl = c.dense_width // w.world
@@ -157,7 +161,8 @@ class Buffers:
             shape = SimpleNamespace(dims=D, width=ml, count=c.experts)
             self.exl3 = Exl3Scratch(shape, rows, slots, device=dev,
                 grouped_mode=GROUPED_MODES[GROUPED_MODE] if c.full else 0,
-                route_mode=ROUTE_MODES[ROUTE_MODE] if c.full else 0)
+                route_mode=ROUTE_MODES[ROUTE_MODE] if c.full else 0,
+                compact_tiles=COMPACT_TILES and c.full and prefill)
             configure_expert_tiles(self.exl3, full=c.full)
             self.ey = self.exl3.y.view(rows, slots, D)
             self.sgu = torch.empty((rows, 2 * sl), dtype=bf, device=dev)
@@ -592,7 +597,7 @@ def dense_attention(qa: torch.Tensor, lc: torch.Tensor, pos_dev: torch.Tensor, s
     """``latent.attention`` in blocks of ``part_rows`` rows, each at its first row's position: one call's bits a row."""
 
     R, step = qa.shape[0], s.part_rows
-    hb = latent.head_block(R, qa.shape[2])
+    hb = latent.head_block(R, qa.shape[2]) if latent.DENSE_POLICY == "legacy" else None
     if R <= step:
         return latent.attention(qa, lc, pos_dev, s, scale=scale, nch=nch, out=out, hb=hb, qpe=qpe, kpe=kpe)
     for r0 in range(0, R, step):
@@ -706,7 +711,8 @@ def _dsa_latent_context(a, w: Weights, layer: LayerW, lc: torch.Tensor, kc: torc
                                                       index[2].shape[0] - 2, pos_dev, bucket=sparse_np)
         with prof.timed("dsa: sparse attention"):
             latent.sparse_attention(qa, lc, tokens, counts, ol, scale,
-                                    qpe=s.qpe[:R] if c.qk_rope else None, kpe=kc if c.qk_rope else None, scratch=s)
+                                    qpe=s.qpe[:R] if c.qk_rope else None, kpe=kc if c.qk_rope else None, scratch=s,
+                                    bucket=sparse_np if sparse_np is not None else (sparse53.score_bucket(host_pos, R, lc.shape[0]) if host_pos is not None else None))
     return ol
 
 

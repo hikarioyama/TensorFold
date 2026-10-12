@@ -10,7 +10,7 @@ void exl3_linear_pair_cuda(const at::Tensor&, const at::Tensor&, int64_t, int64_
                            const c10::optional<at::Tensor>&, at::Tensor&, const c10::optional<at::Tensor>&,
                            at::Tensor&, const at::Tensor&, const at::Tensor&, int64_t, int64_t, const at::Tensor&,
                            const c10::optional<at::Tensor>&, at::Tensor&, const c10::optional<at::Tensor>&,
-                           at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+                           at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool);
 void exl3_unpack_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 
 static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
@@ -63,7 +63,7 @@ void rot_in2(const at::Tensor& x, const at::Tensor& suh1, at::Tensor xh1, const 
 void linear(const at::Tensor& xh, const at::Tensor& T, int64_t stride_k, int64_t stride_nb, const at::Tensor& svh,
             const c10::optional<at::Tensor>& bias, at::Tensor y, const c10::optional<at::Tensor>& Z,
             at::Tensor counters, int64_t K2, int64_t cb, int64_t SK, int64_t WK, int64_t mode) {
-    TORCH_CHECK(mode == 0 || mode == 1 || mode == 3 || mode == 7, "linear mode must be 0, 1, 3 or 7");
+    TORCH_CHECK(mode == 0 || mode == 1 || mode == 3 || mode == 7 || mode == 9, "linear mode must be 0, 1, 3, 7 or 9");
     check(xh, at::kHalf, "xh");
     check_out(y, "y");
     check(svh, at::kHalf, "svh");
@@ -93,8 +93,8 @@ void linear2(const at::Tensor& xh1, const at::Tensor& T1, int64_t stride_k1, int
              const c10::optional<at::Tensor>& Z1, at::Tensor counters1, const at::Tensor& xh2, const at::Tensor& T2,
              int64_t stride_k2, int64_t stride_nb2, const at::Tensor& svh2, const c10::optional<at::Tensor>& bias2,
              at::Tensor y2, const c10::optional<at::Tensor>& Z2, at::Tensor counters2, int64_t K2, int64_t cb,
-             int64_t SK1, int64_t SK2, int64_t WK, int64_t mode) {
-    TORCH_CHECK(mode == 0 || mode == 1 || mode == 3 || mode == 7, "linear mode must be 0, 1, 3 or 7");
+             int64_t SK1, int64_t SK2, int64_t WK, int64_t mode, bool compact) {
+    TORCH_CHECK(mode == 0 || mode == 1 || mode == 3 || mode == 7 || mode == 9, "linear mode must be 0, 1, 3, 7 or 9");
     check(xh1, at::kHalf, "xh1");
     check(xh2, at::kHalf, "xh2");
     check_out(y1, "y1");
@@ -128,7 +128,7 @@ void linear2(const at::Tensor& xh1, const at::Tensor& T1, int64_t stride_k1, int
     }
     c10::cuda::CUDAGuard guard(xh1.device());
     exl3_linear_pair_cuda(xh1, T1, stride_k1, stride_nb1, svh1, bias1, y1, Z1, counters1, xh2, T2, stride_k2,
-                          stride_nb2, svh2, bias2, y2, Z2, counters2, K2, cb, SK1, SK2, WK, mode);
+                          stride_nb2, svh2, bias2, y2, Z2, counters2, K2, cb, SK1, SK2, WK, mode, compact);
 }
 
 // W [K, N] fp16 = W_q, the trellis tiles decoded; tile (kt, nt) at kt * stride_k + (nt / 8) * stride_nb words.
@@ -145,6 +145,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rot_in", &rot_in);
     m.def("rot_in2", &rot_in2);
     m.def("linear", &linear, pybind11::arg("xh"), pybind11::arg("T"), pybind11::arg("stride_k"), pybind11::arg("stride_nb"), pybind11::arg("svh"), pybind11::arg("bias"), pybind11::arg("y"), pybind11::arg("Z"), pybind11::arg("counters"), pybind11::arg("K2"), pybind11::arg("cb"), pybind11::arg("SK"), pybind11::arg("WK"), pybind11::arg("mode") = 0);
-    m.def("linear2", &linear2, pybind11::arg("xh1"), pybind11::arg("T1"), pybind11::arg("stride_k1"), pybind11::arg("stride_nb1"), pybind11::arg("svh1"), pybind11::arg("bias1"), pybind11::arg("y1"), pybind11::arg("Z1"), pybind11::arg("counters1"), pybind11::arg("xh2"), pybind11::arg("T2"), pybind11::arg("stride_k2"), pybind11::arg("stride_nb2"), pybind11::arg("svh2"), pybind11::arg("bias2"), pybind11::arg("y2"), pybind11::arg("Z2"), pybind11::arg("counters2"), pybind11::arg("K2"), pybind11::arg("cb"), pybind11::arg("SK1"), pybind11::arg("SK2"), pybind11::arg("WK"), pybind11::arg("mode") = 0);
+    m.def("linear2", &linear2, pybind11::arg("xh1"), pybind11::arg("T1"), pybind11::arg("stride_k1"), pybind11::arg("stride_nb1"), pybind11::arg("svh1"), pybind11::arg("bias1"), pybind11::arg("y1"), pybind11::arg("Z1"), pybind11::arg("counters1"), pybind11::arg("xh2"), pybind11::arg("T2"), pybind11::arg("stride_k2"), pybind11::arg("stride_nb2"), pybind11::arg("svh2"), pybind11::arg("bias2"), pybind11::arg("y2"), pybind11::arg("Z2"), pybind11::arg("counters2"), pybind11::arg("K2"), pybind11::arg("cb"), pybind11::arg("SK1"), pybind11::arg("SK2"), pybind11::arg("WK"), pybind11::arg("mode") = 0, pybind11::arg("compact") = false);
     m.def("unpack", &unpack);
 }

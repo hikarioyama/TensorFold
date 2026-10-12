@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -14,6 +15,22 @@ CODEBOOK_IDS = {"3inst": 0, "mcg": 1, "mul1": 2}
 ROWS = 128                 # rows a call takes; a caller with more dispatches tiles (never a row of its own)
 # A pair call rotates both parts' input in one launch (plan K1-b2); off keeps two rot_in launches for an A/B.
 PAIR_ROT2 = True
+PAIR_COMPACT = os.environ.get("TF_EXL3_PAIR_COMPACT", "0")
+if PAIR_COMPACT not in ("0", "1"):
+    raise ValueError("TF_EXL3_PAIR_COMPACT must be 0 or 1")
+PAIR_COMPACT = PAIR_COMPACT == "1"
+PREFILL_G2 = os.environ.get("TF_EXL3_PREFILL_G2", "0")
+if PREFILL_G2 not in ("0", "1"):
+    raise ValueError("TF_EXL3_PREFILL_G2 must be 0 or 1")
+PREFILL_G2 = PREFILL_G2 == "1"
+G2_ROWS = (32, 64, 128)
+
+
+def launch_mode(layer, rows):
+    if PREFILL_G2 and rows in G2_ROWS and layer.kernel_mode == 7 and layer.codebook == "mul1" and layer.bits in (4, 5, 6):
+        return 9
+    return layer.kernel_mode
+
 
 
 @lru_cache(maxsize=1)
@@ -313,7 +330,7 @@ class Exl3Linear:
         ext = _ext()
         ext.rot_in(x, self.suh, xh)
         ext.linear(xh, self.words, sk_stride, nb_stride, self.svh, self.bias, out, z if sk > 1 else None,
-                   self.counters if counters is None else counters, self.k2, CODEBOOK_IDS[self.codebook], sk, wk, self.kernel_mode)
+                   self.counters if counters is None else counters, self.k2, CODEBOOK_IDS[self.codebook], sk, wk, launch_mode(self, m))
         return out
 
     def unpack(self, out: torch.Tensor | None = None) -> torch.Tensor:
@@ -366,7 +383,7 @@ def pair_call(a: "Exl3Linear", b: "Exl3Linear", x: torch.Tensor, out_a: torch.Te
                                   else torch.empty((sk_b * m * b.n,), dtype=torch.float32, device=x.device))
     ext.linear2(xh_a, a.words, *a.strides, a.svh, a.bias, out_a, z_a,
                 a.counters if c_a is None else c_a, xh_b, b.words, *b.strides, b.svh, b.bias, out_b, z_b,
-                b.counters if c_b is None else c_b, a.k2, CODEBOOK_IDS[a.codebook], sk_a, sk_b, wk, a.kernel_mode)
+                b.counters if c_b is None else c_b, a.k2, CODEBOOK_IDS[a.codebook], sk_a, sk_b, wk, launch_mode(a, m), *((True,) if PAIR_COMPACT else ()))
 
 
 def unpack_cuda(trellis: torch.Tensor, codebook: str) -> torch.Tensor:

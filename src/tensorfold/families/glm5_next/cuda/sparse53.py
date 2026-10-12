@@ -37,12 +37,17 @@ if SELECTOR_MODE not in ("legacy", "parallel"):
     raise ValueError("TF_GLM_SELECTOR_MODE: legacy or parallel")
 
 
-def selection_scratch(rows, capacity, device):
+PREFILL_SELECTOR = os.environ.get("TF_GLM_PREFILL_SELECTOR", "legacy")
+if PREFILL_SELECTOR not in ("legacy", "parallel"):
+    raise ValueError("TF_GLM_PREFILL_SELECTOR: legacy or parallel")
+
+
+def selection_scratch(rows, capacity, device, *, prefill=False):
     """One reusable integer workspace per decode buffer, shared by its serial layers."""
-    if SELECTOR_MODE != "parallel":
+    if SELECTOR_MODE != "parallel" or (prefill and PREFILL_SELECTOR != "parallel"):
         return None
     from .selection53 import Scratch
-    return Scratch(min(rows, 8), capacity, device)
+    return Scratch(min(rows, 32 if prefill else 8), capacity, device)
 
 
 @triton.jit
@@ -271,7 +276,7 @@ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, ik: torch.Tensor, pos_dev
         _sel_scores[(n, triton.cdiv(npn, SEL_BN))](qi[a:a + n], wts[a:a + n], wts.stride(0), ik, sc[:n], sc.stride(0), at, n, npn,
                                                    scale, H=H, HP=max(16, triton.next_power_of_2(H)), D=D,
                                                    BN=SEL_BN, num_warps=4)
-        if SELECTOR_MODE == "parallel" and parallel_scratch is not None and n <= 8 and npn >= 16384:
+        if SELECTOR_MODE == "parallel" and parallel_scratch is not None and n <= parallel_scratch.rows and npn >= 16384:
             # The scores and tie rule are unchanged. Large prefill slabs retain
             # their existing row-parallel selector and allocate no extra arena.
             from .selection53 import select

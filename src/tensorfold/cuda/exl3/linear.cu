@@ -354,16 +354,227 @@ __global__ void __launch_bounds__(WK * 32) linear_pair_kernel(
     const half* __restrict__ xh1, const uint32_t* __restrict__ T1, long long k1, long long nb1, const half* svh1,
     const half* bias1, void* y1, int y1_dtype, long long ys1, float* Z1, int* c1, int M, int K1, int N1, int SK1,
     const half* __restrict__ xh2, const uint32_t* __restrict__ T2, long long k2, long long nb2, const half* svh2,
-    const half* bias2, void* y2, int y2_dtype, long long ys2, float* Z2, int* c2, int K2n, int N2, int SK2) {
+    const half* bias2, void* y2, int y2_dtype, long long ys2, float* Z2, int* c2, int K2n, int N2, int SK2, bool compact) {
     const int w1 = N1 / 128;
-    if (blockIdx.x < (unsigned)w1) {
-        if (blockIdx.y < (unsigned)SK1) {
+    const int a_count = w1 * SK1;
+    const bool part_a = compact ? blockIdx.x < (unsigned)a_count : blockIdx.x < (unsigned)w1;
+    const int nb = compact ? (part_a ? blockIdx.x / SK1 : (blockIdx.x - a_count) / SK2)
+                           : (part_a ? blockIdx.x : blockIdx.x - w1);
+    const int split = compact ? (part_a ? blockIdx.x % SK1 : (blockIdx.x - a_count) % SK2) : blockIdx.y;
+    if (part_a) {
+        if (split < SK1) {
             linear_part<K2, CB, WK, TRANSPOSE, COOPERATIVE>(xh1, T1, k1, nb1, svh1, bias1, y1, y1_dtype, ys1, Z1, c1, M, K1, N1, SK1,
-                                    blockIdx.x, blockIdx.y);
+                                    nb, split);
         }
-    } else if (blockIdx.y < (unsigned)SK2) {
+    } else if (split < SK2) {
         linear_part<K2, CB, WK, TRANSPOSE, COOPERATIVE>(xh2, T2, k2, nb2, svh2, bias2, y2, y2_dtype, ys2, Z2, c2, M, K2n, N2, SK2,
-                                blockIdx.x - w1, blockIdx.y);
+                                nb, split);
+    }
+}
+
+template <int K2, int CB, int WK, bool TRANSPOSE = false, bool COOPERATIVE = false, bool HALF_N = false, int GROUP = 1>
+__device__ __forceinline__ void linear_part_g2(
+    const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
+    const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
+    long long y_stride, float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK,
+    int nb, int split) {
+    constexpr int TW = tile_words<K2>();
+    constexpr int NT = HALF_N ? 4 : 8, NC = NT * 16;
+    const int half_n = HALF_N ? (nb & 1) : 0;
+    if constexpr (HALF_N) nb >>= 1;
+    constexpr int LW = lane_words<K2>();
+    extern __shared__ __align__(16) float red[];              // WK * RH * 128 floats
+    __shared__ int last;
+    const int RH = min(M, 8);                                 // rows of red a warp
+
+    const int NB = N / 128;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int per_warp = (K >> 4) / SK / WK;
+    const int kt0 = split * (per_warp * WK) + warp * per_warp;
+    const uint32_t* tiles = T + nb * stride_nb + half_n * 4 * TW;
+    const int col0 = nb * 128 + half_n * 64;
+    bool prev = false;
+    if constexpr (step_shuffled<K2>()) {
+        int word, offset;
+        lane_start<K2>(lane, word, offset);
+        prev = word != lane / (8 / K2);
+    }
+
+    for (int m0 = 0, pass = 0; m0 < M; m0 += 16 * GROUP, pass += GROUP) {
+
+        float acc[GROUP][NT][2][4];
+#pragma unroll
+        for (int rg = 0; rg < GROUP; ++rg)
+#pragma unroll
+            for (int i = 0; i < NT; ++i)
+#pragma unroll
+                for (int h = 0; h < 2; ++h)
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) acc[rg][i][h][c] = 0.f;
+
+        const uint32_t* tile = tiles + (size_t)kt0 * stride_k;
+        // up to 6 bits the next k step's words are loaded while this one is decoded; 7 and 8 bits load per tile
+        constexpr bool PF = K2 <= 12;
+        constexpr int SR = step_regs<K2, COOPERATIVE, NT>();
+        uint32_t cur[PF ? SR : 1], nxt[PF ? SR : 1];
+        if constexpr (PF) load_step<K2, COOPERATIVE, NT>(tile, lane, cur);
+#pragma unroll 1
+        for (int i = 0; i < per_warp; ++i) {
+            const int kt = kt0 + i;
+            uint32_t av[GROUP][4];
+#pragma unroll
+            for (int rg = 0; rg < GROUP; ++rg) {
+                const int tile_m = m0 + rg * 16;
+                const int R = max(1, min(16, M - tile_m));
+                const int r0 = min(M - 1, tile_m + (g < R ? g : R - 1));
+                const int r1 = min(M - 1, tile_m + (g + 8 < R ? g + 8 : R - 1));
+                const half* x0 = xh + (size_t)r0 * K;
+                const half* x1 = xh + (size_t)r1 * K;
+                av[rg][0] = __ldg(reinterpret_cast<const uint32_t*>(x0 + kt * 16 + 2 * t));
+                av[rg][1] = __ldg(reinterpret_cast<const uint32_t*>(x1 + kt * 16 + 2 * t));
+                av[rg][2] = __ldg(reinterpret_cast<const uint32_t*>(x0 + kt * 16 + 2 * t + 8));
+                av[rg][3] = __ldg(reinterpret_cast<const uint32_t*>(x1 + kt * 16 + 2 * t + 8));
+            }
+            if constexpr (PF) {
+                if (i + 1 < per_warp) load_step<K2, COOPERATIVE, NT>(tile + (size_t)(i + 1) * stride_k, lane, nxt);
+            }
+#pragma unroll
+            for (int j = 0; j < NT; ++j) {
+                uint32_t w[LW];
+                if constexpr (PF) step_lane_words<K2, COOPERATIVE, NT>(cur, j, lane, prev, w);
+                else ldg_lane_words<K2>(tile + (size_t)i * stride_k + j * TW, lane, w);
+                uint32_t b0[2], b1[2];
+                decode_lane<K2, CB>(w, lane, b0, b1);
+#pragma unroll
+                for (int rg = 0; rg < GROUP; ++rg) {
+                    if constexpr (TRANSPOSE) {
+                        uint32_t wa[4] = {b0[0], b1[0], b0[1], b1[1]}, xb[2] = {av[rg][0], av[rg][2]};
+                        mma16816(acc[rg][j][0], wa, xb);
+                    } else {
+                        mma16816(acc[rg][j][0], av[rg], b0);
+                        mma16816(acc[rg][j][1], av[rg], b1);
+                    }
+                }
+            }
+            if constexpr (PF) {
+#pragma unroll
+                for (int q = 0; q < SR; ++q) cur[q] = nxt[q];
+            }
+        }
+
+#pragma unroll
+        for (int rg = 0; rg < GROUP; ++rg) {
+            const int tile_m = m0 + rg * 16;
+            const int R = min(16, M - tile_m);
+            if (R <= 0) continue;
+        // the warps' sums, added in warp order, rows 0-7 of the pass and then rows 8-15
+        for (int rlo = 0; rlo < R; rlo += 8) {
+            const int rn = min(R - rlo, 8);
+            __syncthreads();                         // red is reused by every half and pass
+            if constexpr (TRANSPOSE) {
+                const int ra = 2 * t, rb = ra + 1;
+                const int sa = (ra & 1) | ((ra & 6) << 2), sb = (rb & 1) | ((rb & 6) << 2);
+#pragma unroll
+                for (int i = 0; i < NT; ++i) {
+                    const int col = i * 16 + g;
+                    if (ra < RH) {
+                        red[(warp * RH + ra) * NC + (col ^ sa)] = acc[rg][i][0][0];
+                        red[(warp * RH + ra) * NC + ((col + 8) ^ sa)] = acc[rg][i][0][2];
+                    }
+                    if (rb < RH) {
+                        red[(warp * RH + rb) * NC + (col ^ sb)] = acc[rg][i][0][1];
+                        red[(warp * RH + rb) * NC + ((col + 8) ^ sb)] = acc[rg][i][0][3];
+                    }
+                }
+            } else {
+            if (g < RH) {
+#pragma unroll
+                for (int i = 0; i < NT; ++i)
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const int col = i * 16 + h * 8 + 2 * t;
+                        *reinterpret_cast<float2*>(red + (warp * RH + g) * NC + col) =
+                            rlo ? make_float2(acc[rg][i][h][2], acc[rg][i][h][3]) : make_float2(acc[rg][i][h][0], acc[rg][i][h][1]);
+                    }
+            }
+            }
+            __syncthreads();
+
+            if (SK == 1) {
+                for (int r = warp; r < rn; r += WK) {
+                    float v[4];
+                    const float4 u = red4<TRANSPOSE>(red, r * NC, r, 4 * lane);
+                    v[0] = u.x; v[1] = u.y; v[2] = u.z; v[3] = u.w;
+#pragma unroll
+                    for (int w = 1; w < WK; ++w) {
+                        const float4 q = red4<TRANSPOSE>(red, (w * RH + r) * NC, r, 4 * lane);
+                        v[0] += q.x; v[1] += q.y; v[2] += q.z; v[3] += q.w;
+                    }
+                    finish(v, lane, svh, bias, col0 + 4 * lane);
+                    store4(y, y_dtype, (size_t)(tile_m + rlo + r) * y_stride + col0 + 4 * lane, v);
+                }
+            } else {
+                for (int idx = threadIdx.x; idx < rn * (NC / 4); idx += WK * 32) {
+                    const int r = idx / (NC / 4), c = 4 * (idx % (NC / 4));
+                    float4 s = red4<TRANSPOSE>(red, r * NC, r, c);
+#pragma unroll
+                    for (int w = 1; w < WK; ++w) {
+                        const float4 q = red4<TRANSPOSE>(red, (w * RH + r) * NC, r, c);
+                        s.x += q.x; s.y += q.y; s.z += q.z; s.w += q.w;
+                    }
+                    *reinterpret_cast<float4*>(Z + ((size_t)split * M + tile_m + rlo + r) * N + col0 + c) = s;
+                }
+            }
+        }
+        if (SK > 1) {
+            __threadfence();
+            __syncthreads();
+            if (threadIdx.x == 0) last = atomicAdd(counters + (pass + rg) * NB + nb, 1) == SK * (HALF_N ? 2 : 1) - 1;
+            __syncthreads();
+            if (last) {
+                __threadfence();
+                for (int r = warp; r < R; r += WK) {
+                    const size_t at = ((size_t)tile_m + r) * N + nb * 128 + 4 * lane;
+                    float4 s = __ldcg(reinterpret_cast<const float4*>(Z + at));
+                    for (int q = 1; q < SK; ++q) {
+                        const float4 u = __ldcg(reinterpret_cast<const float4*>(Z + (size_t)q * M * N + at));
+                        s.x += u.x; s.y += u.y; s.z += u.z; s.w += u.w;
+                    }
+                    float v[4] = {s.x, s.y, s.z, s.w};
+                    finish(v, lane, svh, bias, nb * 128 + 4 * lane);
+                    store4(y, y_dtype, (size_t)(tile_m + r) * y_stride + nb * 128 + 4 * lane, v);
+                }
+                if (threadIdx.x == 0) counters[(pass + rg) * NB + nb] = 0;   // every program of the block has arrived
+            }
+        }
+        __syncthreads();                             // red is reused in the next pass
+        }
+    }
+}
+
+
+// Two independent 16-row tiles reuse one trellis decode. G1 is left verbatim.
+template <int K2, int CB, int WK>
+__global__ void __launch_bounds__(WK * 32) linear_g2_kernel(
+    const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
+    const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
+    long long y_stride, float* __restrict__ Z, int* __restrict__ counters, int M, int K, int N, int SK) {
+    linear_part_g2<K2, CB, WK, false, false, false, 2>(xh,T,stride_k,stride_nb,svh,bias,y,y_dtype,y_stride,Z,counters,M,K,N,SK,blockIdx.x,blockIdx.y);
+}
+
+template <int K2, int CB, int WK>
+__global__ void __launch_bounds__(WK * 32) linear_pair_g2_kernel(
+    const half* __restrict__ xh1, const uint32_t* __restrict__ T1, long long k1, long long nb1, const half* svh1,
+    const half* bias1, void* y1, int y1_dtype, long long ys1, float* Z1, int* c1, int M, int K1, int N1, int SK1,
+    const half* __restrict__ xh2, const uint32_t* __restrict__ T2, long long k2, long long nb2, const half* svh2,
+    const half* bias2, void* y2, int y2_dtype, long long ys2, float* Z2, int* c2, int K2n, int N2, int SK2, bool compact) {
+    const int w1=N1/128;
+    if (blockIdx.x < (unsigned)w1) {
+        if (blockIdx.y < (unsigned)SK1)
+            linear_part_g2<K2, CB, WK, false, false, false, 2>(xh1,T1,k1,nb1,svh1,bias1,y1,y1_dtype,ys1,Z1,c1,M,K1,N1,SK1,blockIdx.x,blockIdx.y);
+    } else if (blockIdx.y < (unsigned)SK2) {
+        linear_part_g2<K2, CB, WK, false, false, false, 2>(xh2,T2,k2,nb2,svh2,bias2,y2,y2_dtype,ys2,Z2,c2,M,K2n,N2,SK2,blockIdx.x-w1,blockIdx.y);
     }
 }
 
@@ -442,6 +653,10 @@ void exl3_linear_cuda(const at::Tensor& xh, const at::Tensor& T, int64_t stride_
             if (mode && M <= 8) kernel = WK == 2 ? linear_kernel<K2_, CB_, 2, true>                            \
                  : WK == 4 ? linear_kernel<K2_, CB_, 4, true> : linear_kernel<K2_, CB_, 8, true>;              \
         }                                                                                                    \
+        if constexpr (CB_ == 2 && (K2_ == 8 || K2_ == 10 || K2_ == 12)) {                          \
+            if (mode == 9 && M > 16) kernel = WK == 2 ? linear_g2_kernel<K2_, CB_, 2>                    \
+                : WK == 4 ? linear_g2_kernel<K2_, CB_, 4> : linear_g2_kernel<K2_, CB_, 8>;             \
+        }                                                                                             \
         bool half_n = false;                                                                           \
         if constexpr (K2_ == 10 && CB_ == 2) {                                                           \
             if (mode == 7 && M <= 8 && WK == 4 && SK > 1) {                                                   \
@@ -467,11 +682,13 @@ void exl3_linear_pair_cuda(const at::Tensor& xh1, const at::Tensor& T1, int64_t 
                            at::Tensor& c1, const at::Tensor& xh2, const at::Tensor& T2, int64_t k2, int64_t nb2,
                            const at::Tensor& svh2, const c10::optional<at::Tensor>& bias2, at::Tensor& y2,
                            const c10::optional<at::Tensor>& Z2, at::Tensor& c2, int64_t K2v, int64_t cb, int64_t SK1,
-                           int64_t SK2, int64_t WK, int64_t mode) {
+                           int64_t SK2, int64_t WK, int64_t mode, bool compact) {
     const int M = (int)xh1.size(0), K = (int)xh1.size(1), N1 = (int)y1.size(1), N2 = (int)y2.size(1);
     TORCH_CHECK(xh2.size(0) == M && xh2.size(1) == K, "both parts take the same rows and K");
     TORCH_CHECK(WK == 2 || WK == 4 || WK == 8, "WK must be 2, 4 or 8");
-    dim3 grid((unsigned)(N1 / 128 + N2 / 128), (unsigned)std::max(SK1, SK2));
+    compact = compact && SK1 != SK2 && mode != 9;
+    dim3 grid((unsigned)(compact ? (N1 / 128 * SK1 + N2 / 128 * SK2) : N1 / 128 + N2 / 128),
+              (unsigned)(compact ? 1 : std::max(SK1, SK2)));
     auto stream = at::cuda::getCurrentCUDAStream();
     const half* b1 = bias1 ? reinterpret_cast<const half*>(bias1->data_ptr()) : nullptr;
     const half* b2 = bias2 ? reinterpret_cast<const half*>(bias2->data_ptr()) : nullptr;
@@ -488,6 +705,10 @@ void exl3_linear_pair_cuda(const at::Tensor& xh1, const at::Tensor& T1, int64_t 
         if constexpr (K2_ == 10 && CB_ == 2) {                                                            \
             if ((mode == 3 || mode == 7) && M <= 8 && WK == 8) kernel = linear_pair_kernel<K2_, CB_, 8, true, true>;      \
         }                                                                                                \
+        if constexpr (CB_ == 2 && (K2_ == 8 || K2_ == 10 || K2_ == 12)) {                          \
+            if (mode == 9 && M > 16) kernel = WK == 2 ? linear_pair_g2_kernel<K2_, CB_, 2>               \
+                : WK == 4 ? linear_pair_g2_kernel<K2_, CB_, 4> : linear_pair_g2_kernel<K2_, CB_, 8>;  \
+        }                                                                                             \
         const int smem = (int)(WK * std::min(M, 8) * 128 * sizeof(float));                                     \
         if (smem > 48 * 1024) cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); \
         kernel<<<grid, (unsigned)(WK * 32), smem, stream>>>(                                                   \
@@ -496,7 +717,7 @@ void exl3_linear_pair_cuda(const at::Tensor& xh1, const at::Tensor& T1, int64_t 
             y1.stride(0), z1, c1.data_ptr<int>(), M, K, N1, (int)SK1,                                          \
             reinterpret_cast<const half*>(xh2.data_ptr()), reinterpret_cast<const uint32_t*>(T2.data_ptr()),  \
             k2, nb2, reinterpret_cast<const half*>(svh2.data_ptr()), b2, y2.data_ptr(), dtype_of(y2),          \
-            y2.stride(0), z2, c2.data_ptr<int>(), K, N2, (int)SK2);                                            \
+            y2.stride(0), z2, c2.data_ptr<int>(), K, N2, (int)SK2, compact);                                            \
         C10_CUDA_KERNEL_LAUNCH_CHECK();                                                                        \
         return;                                                                                                \
     }

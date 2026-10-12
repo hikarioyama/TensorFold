@@ -147,7 +147,7 @@ def default_config(K: int, N: int, gateup: bool) -> tuple[int, int, int, int]:
 class Scratch:
     """Buffers for up to ``rows`` rows of ``slots`` slots; slots whose pick is not a routed expert are left to the caller."""
 
-    def __init__(self, ex: Exl3RoutedExperts, rows: int, slots: int, cfg_gu=None, cfg_d=None, device="cuda", grouped_mode: int = 0, route_mode: int = 0) -> None:
+    def __init__(self, ex: Exl3RoutedExperts, rows: int, slots: int, cfg_gu=None, cfg_d=None, device="cuda", grouped_mode: int = 0, route_mode: int = 0, compact_tiles: bool = False) -> None:
         if grouped_mode not in (0, 1, 2, 3):
             raise ValueError("grouped_mode must be in 0..3")
         if route_mode not in (0, 1, 2):
@@ -171,6 +171,9 @@ class Scratch:
         self.count = torch.zeros((1,), dtype=torch.int32, device=device)
         self.members_buf = torch.full((maxu * rows,), -1, dtype=torch.int32, device=device)
         self.rows, self.slots, self.count_experts = rows, slots, ex.count
+        self.compact_tiles = compact_tiles
+        from .tiles import Scratch as TileScratch
+        self.tile_scratch = TileScratch(rows, slots, ex.count, device) if compact_tiles and rows >= 128 else None
 
     def window(self, R: int):
         """(ids, members) sized for R rows: the grids only span what R rows can use."""
@@ -207,16 +210,21 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         if group:
             route = (ext.group, ext.group_ballot, ext.group_parallel)[s.route_mode]
             route(pick, ids, s.count, members, R, slots, E)
+    tiles, tile_count = None, None
+    if getattr(s, "compact_tiles", False) and s.tile_scratch is not None and R >= 128:
+        with timed("moe: nonempty tiles"):
+            tiles, tile_count = s.tile_scratch.build(members, s.count, P)
+    tile_args = () if tiles is None else (tiles, tile_count)
     with timed("moe: gate/up"):
         ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
         nt, w, sk, pf = grouped_config(s, s.cfg_gu, R)
         ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
-                    P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1], s.grouped_mode)
+                    P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1], s.grouped_mode, *tile_args)
         ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, sk, slots, E, float(limit), act_mode)
     with timed("moe: down"):
         nt, w, sk, pf = grouped_config(s, s.cfg_d, R)
         ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
-                    D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1], s.grouped_mode)
+                    D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1], s.grouped_mode, *tile_args)
     if defer_down:
         return s.z
     if wts is None:
