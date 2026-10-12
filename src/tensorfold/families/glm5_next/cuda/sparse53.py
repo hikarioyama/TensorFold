@@ -22,6 +22,8 @@ Dense/sparse boundary: the reference computes sparsely once a row's visible leng
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -30,6 +32,17 @@ SEL_BN = 256          # tokens a scoring program covers: its key tile is BN x di
 #                      shared memory (past this GPU's ~99 KiB block limit). A block only splits the scan, so the
 #                      scores, and with them every row's selection, are the same at any block size.
 SEL_BLOCK = 1024      # tokens a radix-select pass scans
+SELECTOR_MODE = os.environ.get("TF_GLM_SELECTOR_MODE", "legacy")
+if SELECTOR_MODE not in ("legacy", "parallel"):
+    raise ValueError("TF_GLM_SELECTOR_MODE: legacy or parallel")
+
+
+def selection_scratch(rows, capacity, device):
+    """One reusable integer workspace per decode buffer, shared by its serial layers."""
+    if SELECTOR_MODE != "parallel":
+        return None
+    from .selection53 import Scratch
+    return Scratch(min(rows, 8), capacity, device)
 
 
 @triton.jit
@@ -207,7 +220,8 @@ def _counts(POS, OUT, R: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr):
 
 def select_tokens(qi: torch.Tensor, wts: torch.Tensor, ik: torch.Tensor, pos_dev: torch.Tensor, R: int, k: int,
                   np_max: int, *, bucket: int | None = None, scores: torch.Tensor | None = None,
-                  tokens: torch.Tensor | None = None, counts: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+                  tokens: torch.Tensor | None = None, counts: torch.Tensor | None = None,
+                  parallel_scratch=None) -> tuple[torch.Tensor, torch.Tensor]:
     """Each row's ``k`` best visible tokens [R, k] int32 ascending (-1 padded) and its attention count.
 
     ``counts[r]`` is ``k`` for rows whose visible length passes ``k`` (the sparse rows) and 0 for the rows the dense
@@ -257,7 +271,13 @@ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, ik: torch.Tensor, pos_dev
         _sel_scores[(n, triton.cdiv(npn, SEL_BN))](qi[a:a + n], wts[a:a + n], wts.stride(0), ik, sc[:n], sc.stride(0), at, n, npn,
                                                    scale, H=H, HP=max(16, triton.next_power_of_2(H)), D=D,
                                                    BN=SEL_BN, num_warps=4)
-        _select_rows[(n,)](sc[:n], out[a:a + n], sc.stride(0), npn, at, K=k, BLOCK=SEL_BLOCK, num_warps=4)
+        if SELECTOR_MODE == "parallel" and parallel_scratch is not None and n <= 8 and npn >= 16384:
+            # The scores and tie rule are unchanged. Large prefill slabs retain
+            # their existing row-parallel selector and allocate no extra arena.
+            from .selection53 import select
+            select(sc[:n], out[a:a + n], at, npn, parallel_scratch)
+        else:
+            _select_rows[(n,)](sc[:n], out[a:a + n], sc.stride(0), npn, at, K=k, BLOCK=SEL_BLOCK, num_warps=4)
     counts = counts if counts is not None else torch.empty((R,), dtype=torch.int32, device=qi.device)
     _counts[(triton.cdiv(R, 128),)](pos_dev, counts, R, k, 128)
     return out, counts

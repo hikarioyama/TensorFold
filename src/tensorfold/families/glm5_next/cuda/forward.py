@@ -132,6 +132,8 @@ class Buffers:
         self.sel_cnt = torch.empty((rows,), dtype=torch.int32, device=dev) if c.full else None
         self.sel_score = (torch.empty((min(rows, self.SEL_SLAB), self.sel_np), dtype=f32, device=dev)
                           if c.full else None)
+        self.sel_parallel = (sparse53.selection_scratch(rows, self.sel_np, dev)
+                             if c.full and not prefill else None)
         self.sel_owner: int | None = None       # the layer whose selection sel_tok/sel_cnt hold
         # dense MLP
         dl = c.dense_width // w.world
@@ -605,7 +607,8 @@ def _selection(a, w: Weights, layer: LayerW, index, b: Buffers, R: int, pos_dev:
         tokens, counts = sparse53.select_tokens(
             b.qi[:R].view(R, c.index_heads, c.index_dim), b.igr[:R], index[0], pos_dev, R, c.index_topk,
             min(b.sel_np, int(index[0].shape[0])),
-            bucket=sparse_np, scores=b.sel_score, tokens=b.sel_tok[:R], counts=b.sel_cnt[:R])
+            bucket=sparse_np, scores=b.sel_score, tokens=b.sel_tok[:R], counts=b.sel_cnt[:R],
+            parallel_scratch=getattr(b, "sel_parallel", None))
         b.sel_cnt[:R].copy_(counts)
         b.sel_owner = layer.index
     else:

@@ -14,7 +14,7 @@ from tensorfold.cuda.sampling import NUCLEUS, comm_gather, nucleus_rows, one_ran
 from tensorfold.cuda.streams import accept
 from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 
-from . import glue, prof, qmm
+from . import decode_trace, glue, prof, qmm
 from .forward import Buffers, State, chunks_for, commit, compute, stage
 from .mtp import mtp_compute, mtp_forward, mtp_stage
 from .weights import Weights
@@ -191,40 +191,42 @@ class Engine:
 
         R = stage(self.w, self.st, self.buf, tokens)
         dense = self.st.pos + R <= self.w.cfg.dense_limit
-        g, kind = None, "main"
+        g, kind, bucket = None, "main", None
         if self.graphs is not None and dense:
             g = self.graphs.main.get((R, self.st.parity))
         elif self.graphs is not None and self.st.pos >= self.w.cfg.dense_limit and self.st.index:
             # every row past the dense limit: the sparse graph for this pool bucket (same kernels as eager)
             bucket = self.st.select_bucket(self.st.pos, R)
             g, kind = self.graphs.sparse.get((R, self.st.parity, bucket)), "sparse"
-        if g is not None:
-            self.replays[kind] += 1
-            g.replay()
-            return self.buf.logits[:R]
-        self.replays["eager"] += 1
-        return compute(self.w, self.st, self.buf, R, nch=chunks_for(self.st, R), host_pos=self.st.pos)
+        with decode_trace.step(self, "main", R, kind, g is not None, bucket, self.st.parity):
+            if g is not None:
+                self.replays[kind] += 1
+                g.replay()
+                return self.buf.logits[:R]
+            self.replays["eager"] += 1
+            return compute(self.w, self.st, self.buf, R, nch=chunks_for(self.st, R), host_pos=self.st.pos)
 
     def mtp(self, next_tokens: Sequence[int], hidden: torch.Tensor) -> torch.Tensor:
         """The MTP head on rows (hidden, next token): logits of the last row [1, V/world]."""
 
         n = mtp_stage(self.w, self.st, self.mbuf, next_tokens, hidden)
         dense = self.st.mtp_len + n <= self.w.cfg.dense_limit
-        g, kind = None, "mtp"
+        g, kind, bucket = None, "mtp", None
         if self.graphs is not None and not self.mbuf.zero_first and dense:
             g = self.graphs.mtp.get(n)
         elif (self.graphs is not None and not self.mbuf.zero_first and self.st.index
               and self.st.mtp_len >= self.w.cfg.dense_limit):
             bucket = self.st.select_bucket(self.st.mtp_len, n)
             g, kind = self.graphs.sparse_mtp.get((n, bucket)), "sparse_mtp"
-        if g is not None:
-            self.replays[kind] += 1
-            g.replay()
-            return self.mbuf.logits[:1, :self.draft_n]
-        from .attention import CHUNK
+        with decode_trace.step(self, "mtp", n, kind, g is not None, bucket):
+            if g is not None:
+                self.replays[kind] += 1
+                g.replay()
+                return self.mbuf.logits[:1, :self.draft_n]
+            from .attention import CHUNK
 
-        return mtp_compute(self.w, self.st, self.mbuf, n, nch=-(-(self.st.mtp_len + n) // CHUNK),
-                           host_pos=self.st.mtp_len)
+            return mtp_compute(self.w, self.st, self.mbuf, n, nch=-(-(self.st.mtp_len + n) // CHUNK),
+                               host_pos=self.st.mtp_len)
 
     def sample(self, logits: torch.Tensor, positions: Sequence[int], sampling: Sampling | None, *,
                draft: bool = False, probs: list[float] | None = None) -> list[int]:
@@ -515,6 +517,7 @@ def _sync(w: Weights) -> None:
     torch.cuda.synchronize()
 
 
+@decode_trace.traced
 @torch.no_grad()
 def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *,
                   stop_eos: bool = False, on_tokens=None) -> DecodeResult:
@@ -587,6 +590,7 @@ class GainDepthPolicy(DepthPolicy):
                    key=lambda k: sum(p ** j for j in range(k + 1)) / (1 + self.marginal_cost * k))
 
 
+@decode_trace.traced
 @torch.no_grad()
 def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *, policy: DepthPolicy | None = None,
                stop_eos: bool = False, on_tokens=None) -> DecodeResult:
@@ -645,6 +649,7 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
     return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
 
 
+@decode_trace.traced
 @torch.no_grad()
 def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling | None, *,
                   policy: DepthPolicy | None = None, stop_eos: bool = False, on_tokens=None) -> DecodeResult:

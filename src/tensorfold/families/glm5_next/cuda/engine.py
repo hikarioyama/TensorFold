@@ -150,11 +150,11 @@ def kernel_namespace(runtime: str) -> list[int]:
     digest = hashlib.sha256()
     here = Path(__file__).parent
     shared = here.parents[2] / "cuda" / "exl3"
-    files = [here / n for n in ("engine.py", "cache_fp8.py", "decode.py", "graphs.py", "forward.py", "latent.py", "segmented.py", "sparse53.py", "glue.py", "multi.py", "weights53.py", "qmm.py", "mtp.py")]
+    files = [here / n for n in ("engine.py", "cache_fp8.py", "decode.py", "graphs.py", "forward.py", "latent.py", "segmented.py", "sparse53.py", "selection53.py", "glue.py", "multi.py", "weights53.py", "qmm.py", "mtp.py")]
     files += sorted(p for p in shared.iterdir() if p.suffix in (".cu", ".cuh", ".cpp", ".py"))
     files += [shared.parent / "sampling.py", here.parents[2] / "engine" / "exact_sampling.py"]
     # Use the parsed module settings, not an environment that could change after import.
-    settings = (runtime, shared_sampling.AMAX, shared_sampling.UNSORTED, shared_sampling.SINGLETON, fw.EXPERT_TILE, fw.DOWN_COMBINE, fw.INPLACE_GATHER, fw.GROUPED_MODE, fw.ROUTE_MODE,
+    settings = (runtime, shared_sampling.AMAX, shared_sampling.UNSORTED, shared_sampling.SINGLETON, fw.EXPERT_TILE, fw.DOWN_COMBINE, fw.INPLACE_GATHER, fw.GROUPED_MODE, fw.ROUTE_MODE, fw.sparse53.SELECTOR_MODE,
                 weights53.LINEAR_MODE, weights53.CONCAT_DIRECT, weights53.CONCAT_PAIR,
                 decode.NUCLEUS_FALLBACK, decode.NUCLEUS_INITIAL, decode.BATCH_SAMPLING, graphs.PACKED_CACHE_LIMIT, graphs.SAMPLING_GRAPH, graphs.SAMPLING_CACHE_LIMIT, graphs.GRAPH_MISS_MODE, CONTROL_FRAME, MAIN_PAD, GRAPH_ROWS)
     digest.update(repr(settings).encode())
