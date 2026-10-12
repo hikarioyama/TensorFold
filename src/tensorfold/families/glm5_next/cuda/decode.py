@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Sequence
@@ -9,30 +10,56 @@ from typing import Sequence
 import numpy as np
 import torch
 
-from tensorfold.cuda.sampling import comm_gather, nucleus_rows, one_rank
+from tensorfold.cuda.sampling import NUCLEUS, comm_gather, nucleus_rows, one_rank
+from tensorfold.cuda.streams import accept
 from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 
-from . import glue, prof, qmm
+from . import decode_trace, glue, prof, qmm
 from .forward import Buffers, State, chunks_for, commit, compute, stage
 from .mtp import mtp_compute, mtp_forward, mtp_stage
-from .sparse import pool_bucket
 from .weights import Weights
+
+# Optional transfer optimization in the SHARED exact sampler; legacy remains the default.
+BATCH_SAMPLING = os.environ.get("TF_GLM_BATCH_SAMPLING", "0")
+if BATCH_SAMPLING not in ("0", "1"):
+    raise ValueError("TF_GLM_BATCH_SAMPLING must be 0 or 1")
+BATCH_SAMPLING = BATCH_SAMPLING == "1"
+NUCLEUS_INITIAL = int(os.environ.get("TF_GLM_NUCLEUS_INITIAL", str(NUCLEUS)))
+if not 1 <= NUCLEUS_INITIAL <= NUCLEUS:
+    raise ValueError("TF_GLM_NUCLEUS_INITIAL must be in 1..1024")
+NUCLEUS_FALLBACK = int(os.environ.get("TF_GLM_NUCLEUS_FALLBACK", "0"))
+if NUCLEUS_FALLBACK and NUCLEUS_FALLBACK <= 1024:
+    raise ValueError("TF_GLM_NUCLEUS_FALLBACK must be 0 or greater than 1024")
 
 
 def sample_rows(w: Weights, logits: torch.Tensor, positions: Sequence[int], sampling: Sampling | None,
-                offset: int | None = None, probs: list[float] | None = None) -> list[int]:
+                offset: int | None = None, probs: list[float] | None = None, *, stage=None) -> list[int]:
     """Rows of (this rank's vocabulary slice of) logits at their absolute positions -> tokens, same on all ranks."""
 
     R = logits.shape[0]
+    offset = w.vocab_offset if offset is None else offset
+    valid = getattr(w, "meta", {}).get("valid_vocab")
+    if valid is not None and offset + logits.shape[1] > valid:
+        logits = logits.clone()
+        logits[:, max(0, valid - offset):] = -torch.inf
     greedy = sampling is None or sampling.temperature <= 0
     if not greedy and not sampling.top_k:           # top_k off: the shared nucleus rule over every rank's shard
-        return nucleus_rows(logits, positions, sampling, offset=w.vocab_offset if offset is None else offset,
-                            gather=one_rank if w.comm is None else comm_gather(w.comm), probs=probs)
+        return nucleus_rows(logits, positions, sampling, offset=offset,
+                            gather=one_rank if w.comm is None else comm_gather(w.comm), probs=probs,
+                            fallback_candidates=NUCLEUS_FALLBACK, initial_candidates=NUCLEUS_INITIAL, stage=stage)
     k = 1 if greedy else min(logits.shape[1], int(sampling.top_k) + MARGIN)
     if probs is not None and greedy:
         k = min(logits.shape[1], 20 + MARGIN)       # the draft's confidence needs its competitors too
-    vals, ids = torch.topk(logits.float(), k, dim=-1)
-    ids = (ids + (w.vocab_offset if offset is None else offset)).to(torch.int32)
+    values_fp32 = logits.float()
+    if greedy and probs is None:
+        # torch.max returns the first (smallest ID) maximum, unlike topk(k=1).
+        vals, ids = values_fp32.max(dim=-1, keepdim=True)
+    else:
+        # A fixed candidate margin alone cannot resolve a tie longer than that margin.
+        # Preserve the shared CPU sampler; select candidates by exact (value, ID) order.
+        ids = torch.argsort(values_fp32, dim=-1, descending=True, stable=True)[:, :k]
+        vals = values_fp32.gather(1, ids)
+    ids = (ids + offset).to(torch.int32)
     if w.comm is None:
         values = vals.cpu().numpy().astype(np.float32)
         tokens = ids.cpu().numpy().astype(np.int64)
@@ -52,6 +79,56 @@ def sample_rows(w: Weights, logits: torch.Tensor, positions: Sequence[int], samp
     if probs is not None:
         probs.extend(_probability(values, tokens, chosen, sampling))
     return chosen
+
+
+def sample_many(w: Weights, logits: torch.Tensor, positions: Sequence[Sequence[int]],
+                samplings: Sequence[Sampling | None], *,
+                prob_lists: Sequence[list[float] | None] | None = None, stage=None) -> list[list[int]]:
+    """Batch compatible target draws on existing NCCL/sampler, retaining each request's seed.
+
+    Heterogeneous parameters and top-k keep the existing per-request path. No RNG
+    state or request/slot identifier is introduced into the keyed sampling rule.
+    """
+    if len(positions) != len(samplings) or sum(map(len, positions)) != logits.shape[0]:
+        raise ValueError("sample_many: one sampling per segment and one position per logits row required")
+    if prob_lists is not None and len(prob_lists) != len(samplings):
+        raise ValueError("sample_many: one probability sink per segment required")
+    if not samplings:
+        return []
+    want_probs = prob_lists is not None and any(p is not None for p in prob_lists)
+    flat_probs = [] if want_probs else None
+    flat_pos = [p for segment in positions for p in segment]
+    greedy = all(s is None or s.temperature <= 0 for s in samplings)
+    first = samplings[0]
+    nucleus = (first is not None and first.temperature > 0 and not first.top_k
+               and all(s is not None and (s.temperature, s.top_k, s.top_p, s.min_p)
+                       == (first.temperature, first.top_k, first.top_p, first.min_p) for s in samplings))
+    if greedy and not want_probs:
+        chosen = sample_rows(w, logits, flat_pos, None)
+    elif nucleus:
+        valid = getattr(w, "meta", {}).get("valid_vocab")
+        if valid is not None and w.vocab_offset + logits.shape[1] > valid:
+            logits = logits.clone()
+            logits[:, max(0, valid - w.vocab_offset):] = -torch.inf
+        seeds = [s.seed for s, segment in zip(samplings, positions) for _ in segment]
+        chosen = nucleus_rows(logits, flat_pos, first, offset=w.vocab_offset,
+                              gather=one_rank if w.comm is None else comm_gather(w.comm),
+                              fallback_candidates=NUCLEUS_FALLBACK, row_seeds=seeds,
+                              initial_candidates=NUCLEUS_INITIAL, probs=flat_probs, stage=stage)
+    else:
+        out, start = [], 0
+        for i, (segment, sampling) in enumerate(zip(positions, samplings)):
+            out.append(sample_rows(w, logits[start:start + len(segment)], segment, sampling,
+                                   probs=None if prob_lists is None else prob_lists[i], stage=stage))
+            start += len(segment)
+        return out
+    out, start = [], 0
+    for i, segment in enumerate(positions):
+        out.append(chosen[start:start + len(segment)])
+        if want_probs and prob_lists[i] is not None:
+            prob_lists[i].extend(flat_probs[start:start + len(segment)])
+        start += len(segment)
+    return out
 
 
 def _probability(values: np.ndarray, tokens: np.ndarray, chosen: list[int], sampling: Sampling | None) -> list[float]:
@@ -114,40 +191,42 @@ class Engine:
 
         R = stage(self.w, self.st, self.buf, tokens)
         dense = self.st.pos + R <= self.w.cfg.dense_limit
-        g, kind = None, "main"
+        g, kind, bucket = None, "main", None
         if self.graphs is not None and dense:
             g = self.graphs.main.get((R, self.st.parity))
-        elif self.graphs is not None and self.st.pos >= self.w.cfg.dense_limit and self.st.index is not None:
+        elif self.graphs is not None and self.st.pos >= self.w.cfg.dense_limit and self.st.index:
             # every row past the dense limit: the sparse graph for this pool bucket (same kernels as eager)
-            bucket = pool_bucket(self.st.pos, R, self.st.index[0][2].shape[0] - 2)
+            bucket = self.st.select_bucket(self.st.pos, R)
             g, kind = self.graphs.sparse.get((R, self.st.parity, bucket)), "sparse"
-        if g is not None:
-            self.replays[kind] += 1
-            g.replay()
-            return self.buf.logits[:R]
-        self.replays["eager"] += 1
-        return compute(self.w, self.st, self.buf, R, nch=chunks_for(self.st, R), host_pos=self.st.pos)
+        with decode_trace.step(self, "main", R, kind, g is not None, bucket, self.st.parity):
+            if g is not None:
+                self.replays[kind] += 1
+                g.replay()
+                return self.buf.logits[:R]
+            self.replays["eager"] += 1
+            return compute(self.w, self.st, self.buf, R, nch=chunks_for(self.st, R), host_pos=self.st.pos)
 
     def mtp(self, next_tokens: Sequence[int], hidden: torch.Tensor) -> torch.Tensor:
         """The MTP head on rows (hidden, next token): logits of the last row [1, V/world]."""
 
         n = mtp_stage(self.w, self.st, self.mbuf, next_tokens, hidden)
         dense = self.st.mtp_len + n <= self.w.cfg.dense_limit
-        g, kind = None, "mtp"
+        g, kind, bucket = None, "mtp", None
         if self.graphs is not None and not self.mbuf.zero_first and dense:
             g = self.graphs.mtp.get(n)
-        elif (self.graphs is not None and not self.mbuf.zero_first and self.st.index is not None
+        elif (self.graphs is not None and not self.mbuf.zero_first and self.st.index
               and self.st.mtp_len >= self.w.cfg.dense_limit):
-            bucket = pool_bucket(self.st.mtp_len, n, self.st.index[-1][2].shape[0] - 2)
+            bucket = self.st.select_bucket(self.st.mtp_len, n)
             g, kind = self.graphs.sparse_mtp.get((n, bucket)), "sparse_mtp"
-        if g is not None:
-            self.replays[kind] += 1
-            g.replay()
-            return self.mbuf.logits[:1, :self.draft_n]
-        from .attention import CHUNK
+        with decode_trace.step(self, "mtp", n, kind, g is not None, bucket):
+            if g is not None:
+                self.replays[kind] += 1
+                g.replay()
+                return self.mbuf.logits[:1, :self.draft_n]
+            from .attention import CHUNK
 
-        return mtp_compute(self.w, self.st, self.mbuf, n, nch=-(-(self.st.mtp_len + n) // CHUNK),
-                           host_pos=self.st.mtp_len)
+            return mtp_compute(self.w, self.st, self.mbuf, n, nch=-(-(self.st.mtp_len + n) // CHUNK),
+                               host_pos=self.st.mtp_len)
 
     def sample(self, logits: torch.Tensor, positions: Sequence[int], sampling: Sampling | None, *,
                draft: bool = False, probs: list[float] | None = None) -> list[int]:
@@ -279,19 +358,17 @@ def _put_ring_window(drafter, n: int, rows: list[torch.Tensor]) -> None:
 
 
 def _row_views(st, n: int, m: int) -> list[torch.Tensor]:
-    """Views of the attention rows a snapshot of n tokens (m in the MTP head) depends on: latents or keys and values, indexer keys, gates and pools."""
+    """Views of the attention rows a snapshot of n tokens (m in the MTP head) depends on: latents or keys and values, the rotary key parts, and the indexer planes."""
     views = [kc[:n] for kc in st.kc] + [vc[:n] for vc in st.vc if vc is not None]
-    idx = st.index or []
-    main_idx = idx[:len(st.kc)]
-    for ik, ig, pk in main_idx:
-        views += [ik[:n], ig[:n], pk[:n // 4 + 1]]
+    if st.latent:
+        views += [kpe[:n] for kpe in st.kpe]
+    views += st.index_rows(n, m)
     if m > 0 and hasattr(st, "mtp_kc"):
         views.append(st.mtp_kc[:m])
         if getattr(st, "mtp_vc", None) is not None:
             views.append(st.mtp_vc[:m])
-        if len(idx) > len(st.kc):
-            ik, ig, pk = idx[-1]
-            views += [ik[:m], ig[:m], pk[:m // 4 + 1]]
+        if st.latent:
+            views.append(st.mtp_kpe[:m])
     return views
 
 
@@ -440,6 +517,7 @@ def _sync(w: Weights) -> None:
     torch.cuda.synchronize()
 
 
+@decode_trace.traced
 @torch.no_grad()
 def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *,
                   stop_eos: bool = False, on_tokens=None) -> DecodeResult:
@@ -474,7 +552,8 @@ class DepthPolicy:
     """Choose a fixed draft count or adapt it to running acceptance."""
 
     def __init__(self, most: int = 3, fixed: bool = False, low: float = 0.8, high: float = 0.9,
-                 confidence: float = 0.0) -> None:
+                 confidence: float = 0.0, temperature_scale: float = 1.0) -> None:
+        self.temperature_scale = temperature_scale
         self.most, self.fixed, self.low, self.high = most, fixed, low, high
         self.confidence = confidence
         self.rate = 0.8
@@ -487,6 +566,31 @@ class DepthPolicy:
         return max(1, min(self.most, 1 if self.rate < self.low else 2 if self.rate < self.high else 3))
 
 
+class GainDepthPolicy(DepthPolicy):
+    """Experimental count-only proposal depth; a rejected suffix is censored, not many failures.
+
+    Target sampling and acceptance are unchanged. COST is a normalized marginal
+    round-cost heuristic, not a claimed hardware latency or measured speedup.
+    """
+    def __init__(self, most=7, *, decay=.7, marginal_cost=.16):
+        if not 1 <= most <= 7 or not 0 <= decay < 1 or not 0 < marginal_cost <= 4:
+            raise ValueError("invalid gain policy parameters")
+        super().__init__(most)
+        self.decay, self.marginal_cost = decay, marginal_cost
+        self.successes, self.trials = 1.8, 2.
+
+    def next(self, drafted, accepted):
+        if not 0 <= accepted <= drafted:
+            raise ValueError("accepted draft prefix must fit drafted count")
+        if drafted:
+            self.successes = self.decay * self.successes + accepted
+            self.trials = self.decay * self.trials + accepted + int(accepted < drafted)
+        p = self.successes / self.trials
+        return max(range(1, self.most + 1),
+                   key=lambda k: sum(p ** j for j in range(k + 1)) / (1 + self.marginal_cost * k))
+
+
+@decode_trace.traced
 @torch.no_grad()
 def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *, policy: DepthPolicy | None = None,
                stop_eos: bool = False, on_tokens=None) -> DecodeResult:
@@ -502,8 +606,9 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
     _sync(w)
     start = time.perf_counter()
     t0 = time.perf_counter()
-    depth = min(policy.next(0, 0), count - len(out))
-    drafts = draft(e, e.last_hidden, [pending], st.pos + 1, depth, sampling, policy.confidence) if depth > 0 else []
+    depth = max(0, min(policy.next(0, 0), count - len(out) - 1))
+    drafts = (draft(e, e.last_hidden, [pending], st.pos + 1, depth, sampling, policy.confidence)
+              if depth > 0 and not (stop_eos and pending in w.cfg.eos) else [])
     stages["draft"] += time.perf_counter() - t0
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
         t0 = time.perf_counter()
@@ -514,11 +619,10 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
         torch.cuda.synchronize()
         t1 = time.perf_counter()
         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
-        keep = 1
-        for i, d in enumerate(drafts):
-            if sampled[i] != d or (stop_eos and sampled[i] in w.cfg.eos):
-                break
-            keep += 1
+        path, terminal = accept(tokens, list(range(-1, R - 1)), sampled,
+                                count - len(out), w.cfg.eos if stop_eos else ())
+        keep = len(path)
+        new = [tokens[r] for r in path[1:]] + [terminal]
         t2 = time.perf_counter()
         commit(w, st, b, R, keep)
         t3 = time.perf_counter()
@@ -527,24 +631,25 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
         accepted += keep - 1
         depths.append(len(drafts))
         keeps.append(keep)
-        e.follow(sampled[:keep])
-        out.extend(sampled[:keep])
+        e.follow(new)
+        out.extend(new)
         if on_tokens is not None:
-            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
+            on_tokens(new)
         stages["forward"] += t1 - t0
         stages["sample"] += t2 - t1
         stages["commit"] += t3 - t2
         if len(out) >= count or (stop_eos and out[-1] in w.cfg.eos):
             break
         t4 = time.perf_counter()
-        depth = min(policy.next(len(drafts), keep - 1), count - len(out))
-        drafts = (draft(e, e.main_hidden(slice(0, keep)), sampled[:keep], st.pos + 1, depth, sampling,
+        depth = max(0, min(policy.next(len(drafts), keep - 1), count - len(out) - 1))
+        drafts = (draft(e, e.main_hidden(slice(0, keep)), new, st.pos + 1, depth, sampling,
                         policy.confidence) if depth > 0 else [])
         stages["draft"] += time.perf_counter() - t4
     _sync(w)
     return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
 
 
+@decode_trace.traced
 @torch.no_grad()
 def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling | None, *,
                   policy: DepthPolicy | None = None, stop_eos: bool = False, on_tokens=None) -> DecodeResult:
@@ -559,7 +664,7 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
     keeps: list[int] = []
     _sync(w)
     start = time.perf_counter()
-    depth = min(policy.next(0, 0), count - len(out))
+    depth = max(0, min(policy.next(0, 0), count - len(out) - 1))
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
         t0 = time.perf_counter()
         drafts = drafter.propose(out[-1], depth, sampling, policy.confidence) if depth > 0 else []
@@ -571,11 +676,10 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
         torch.cuda.synchronize()
         t2 = time.perf_counter()
         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
-        keep = 1
-        for i, d in enumerate(drafts):
-            if sampled[i] != d or (stop_eos and sampled[i] in w.cfg.eos):
-                break
-            keep += 1
+        path, terminal = accept(tokens, list(range(-1, R - 1)), sampled,
+                                count - len(out), w.cfg.eos if stop_eos else ())
+        keep = len(path)
+        new = [tokens[r] for r in path[1:]] + [terminal]
         t3 = time.perf_counter()
         commit(w, st, b, R, keep)
         t4 = time.perf_counter()
@@ -586,14 +690,14 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
         accepted += keep - 1
         depths.append(len(drafts))
         keeps.append(keep)
-        e.follow(sampled[:keep])
-        out.extend(sampled[:keep])
+        e.follow(new)
+        out.extend(new)
         if on_tokens is not None:
-            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
+            on_tokens(new)
         stages["draft"] += (t1 - t0) + (t5 - t4)
         stages["forward"] += t2 - t1
         stages["sample"] += t3 - t2
         stages["commit"] += t4 - t3
-        depth = min(policy.next(len(drafts), keep - 1), count - len(out))
+        depth = max(0, min(policy.next(len(drafts), keep - 1), count - len(out) - 1))
     _sync(w)
     return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)

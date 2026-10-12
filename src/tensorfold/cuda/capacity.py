@@ -90,13 +90,20 @@ def config(model_dir: str | Path) -> dict:
 def headers(model_dir: str | Path, *, rank: int | None = None, files: list[Path] | None = None) -> dict:
     path = Path(model_dir)
     files = list(files or []) or (sorted(path.glob(f"*.rank{rank}.safetensors")) if rank is not None else [])
+    owned: dict[str, set[str]] | None = None       # a name's file according to the index, when it named the files
     if not files:
         other = sorted(path.glob("*.rank*.safetensors"))
         if other:
             raise ValueError("checkpoint contains another rank's split weights; use this rank's folder")
         index = path / "model.safetensors.index.json"
-        files = ([path / n for n in sorted(set(json.loads(index.read_text())["weight_map"].values()))]
-                 if index.exists() else sorted(path.glob("*.safetensors")))
+        if index.exists():
+            weight_map = json.loads(index.read_text())["weight_map"]
+            files = [path / n for n in sorted(set(weight_map.values()))]
+            owned = {}
+            for name, rel in weight_map.items():
+                owned.setdefault(name, set()).add(rel)
+        else:
+            files = sorted(path.glob("*.safetensors"))
     if not files:
         raise ValueError("startup memory estimate needs the checkpoint tensor headers")
     out = {}
@@ -109,6 +116,9 @@ def headers(model_dir: str | Path, *, rank: int | None = None, files: list[Path]
         for name, info in entries.items():
             if name == "__metadata__":
                 continue
+            if owned is not None and file.name not in owned.get(name, ()):
+                continue                               # a copy the index does not name (one export repeats the MTP
+                #                                            layer byte for byte: the index's file owns it)
             if name in out:
                 raise ValueError(f"duplicate checkpoint tensor: {name}")
             shape = info["shape"]

@@ -260,27 +260,28 @@ def test_top_pools_equals_stable_sort_with_ties():
 
 
 @cuda
-def test_prefill_head_tiles_give_the_decode_tiles_bits():
-    """Prefill chunks (64 rows or more) run a rank's heads in one 32-head tile, decode windows in 16-head tiles:
-    each row gets the same bits either way, dense and sparse."""
+@pytest.mark.parametrize("lw", [256, 512])
+def test_prefill_head_tiles_give_the_decode_tiles_bits(lw):
+    """Prefill chooses a wide tile only when shared memory permits it; either width retains serial bits."""
     from tensorfold.families.glm5_next.cuda import latent
 
-    assert latent.head_block(64) == latent.HB_WIDE and latent.head_block(8) == latent.HB
+    assert latent.head_block(64, lw) == (latent.HB_WIDE if lw == 256 else latent.HB)
+    assert latent.head_block(8, lw) == latent.HB
     gen = torch.Generator().manual_seed(7)
     heads = 32
     n, R, W = 6000, 72, 2051
-    cache = torch.randn((n, L), generator=gen).to(torch.bfloat16).cuda()
-    qa = (torch.randn((R, heads, L), generator=gen) * 0.05).to(torch.bfloat16).cuda()
+    cache = torch.randn((n, lw), generator=gen).to(torch.bfloat16).cuda()
+    qa = (torch.randn((R, heads, lw), generator=gen) * 0.05).to(torch.bfloat16).cuda()
     # dense: rows at P .. P + R - 1 against their serial steps
     P = 1500
-    s = latent.LatentScratch(R, heads, latent.chunks_for(P + R), "cuda")
+    s = latent.LatentScratch(R, heads, latent.chunks_for(P + R), "cuda", lw=lw)
     pos = torch.tensor([P], dtype=torch.int32, device="cuda")
     wide = latent.attention(qa, cache, pos, s, scale=0.07, nch=latent.chunks_for(P + R),
-                            out=torch.empty((R, heads, L), dtype=torch.bfloat16, device="cuda")).clone()
+                            out=torch.empty((R, heads, lw), dtype=torch.bfloat16, device="cuda")).clone()
     for r in (0, 1, 37, R - 1):
         one = latent.attention(qa[r:r + 1].contiguous(), cache, torch.tensor([P + r], dtype=torch.int32, device="cuda"),
                                s, scale=0.07, nch=latent.chunks_for(P + R),
-                               out=torch.empty((1, heads, L), dtype=torch.bfloat16, device="cuda"))
+                               out=torch.empty((1, heads, lw), dtype=torch.bfloat16, device="cuda"))
         assert torch.equal(wide[r], one[0]), f"dense row {r}"
     # sparse: each row's own selection
     tokens = torch.full((R, W), -1, dtype=torch.int32)
@@ -290,10 +291,10 @@ def test_prefill_head_tiles_give_the_decode_tiles_bits():
         tokens[r, :sel.numel()] = sel.to(torch.int32)
         counts.append(sel.numel())
     tokens, counts = tokens.cuda(), torch.tensor(counts, dtype=torch.int32, device="cuda")
-    wide = torch.zeros((R, heads, L), dtype=torch.bfloat16, device="cuda")
+    wide = torch.zeros((R, heads, lw), dtype=torch.bfloat16, device="cuda")
     latent.sparse_attention(qa, cache, tokens, counts, wide, 0.07)
     for r in (0, 3, 41, R - 1):
-        one = torch.zeros((1, heads, L), dtype=torch.bfloat16, device="cuda")
+        one = torch.zeros((1, heads, lw), dtype=torch.bfloat16, device="cuda")
         latent.sparse_attention(qa[r:r + 1].contiguous(), cache, tokens[r:r + 1].contiguous(),
                                 counts[r:r + 1].contiguous(), one, 0.07)
         assert torch.equal(wide[r], one[0]), f"sparse row {r}"

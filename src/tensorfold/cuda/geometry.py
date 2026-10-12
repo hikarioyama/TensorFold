@@ -110,7 +110,8 @@ def indexed_weights(world: int, mtp: bool, mapped_tables: bool = True):
     return transform
 
 
-def split_weights(rule, world: int = 2):
+def split_weights(rule, world: int = 2, *, draft_head: bool = True):
+    """Loader bytes; only replicated heads are sliced again, and full GLM has no Q4 draft copy."""
     def transform(name: str, info: dict) -> tuple[int, int]:
         kind = rule(name)
         if kind == "drop":
@@ -121,12 +122,14 @@ def split_weights(rule, world: int = 2):
             if shape[axis] % world:
                 raise ValueError(f"checkpoint tensor does not split evenly: {name}")
             shape[axis] //= world
-        if name.startswith("lm_head."):
+        if name.startswith("lm_head.") and kind == "rep":
+            if shape[0] % world:
+                raise ValueError(f"checkpoint head does not split evenly: {name}")
             shape[0] //= world
         cast = name.endswith((".A_log", ".dt_bias", ".hc_attn_base", ".hc_attn_scale", ".hc_ffn_base",
                               ".hc_ffn_scale", ".e_score_correction_bias"))
         total = padded(info, shape, float32=cast, name=name)
-        if name == "lm_head.weight" and info["dtype"] in ("BF16", "F16", "F32"):
+        if draft_head and name == "lm_head.weight" and info["dtype"] in ("BF16", "F16", "F32"):
             total += math.prod(shape) * 9 // 16  # the additional 4-bit draft head
         return total, 0
     return transform
@@ -146,6 +149,8 @@ def layer_counts(t: dict) -> tuple[int, int]:
     if "layer_types" in t:
         linear = sum(kind == "linear_attention" for kind in t["layer_types"])
         return linear, len(t["layer_types"]) - linear
+    if str(t.get("model_type") or "") == "glm_moe_dsa":
+        return 0, int(t["num_hidden_layers"])          # full GLM-5.3: every layer is sparse MLA, no delta attention
     layers, interval = int(t["num_hidden_layers"]), int(t.get("full_attention_interval", 4))
     return layers - layers // interval, layers // interval
 
@@ -252,8 +257,12 @@ def exl3_expert_scratch(rows: int, slots: int, d: int, width: int) -> int:
 
 
 def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560, latent: bool = False,
-                 mtp: bool | None = None) -> Geometry:
+                 mtp: bool | None = None, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS) -> Geometry:
     """GLM's engine; ``mtp``: whether it holds the MTP head's caches and buffers (None: when the checkpoint has one)."""
+    if kv_dtype not in ("bf16", "fp8") or (kv_dtype == "fp8" and not (latent and t.get("model_type") == "glm_moe_dsa")):
+        raise ValueError("FP8 cache geometry requires full GLM latent attention")
+    if prefill_rows < 1:
+        raise ValueError("prefill_rows must be positive")
     linear, attention = layer_counts(t)
     lin = t.get("linear_attn_config") or {}
     heads = int(t["num_attention_heads"]) // world
@@ -263,7 +272,10 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
     kd = int(t["qk_nope_head_dim"]) + int(t.get("qk_rope_head_dim", 0))
     vd, index = int(t["v_head_dim"]), int(t.get("index_head_dim", 128))
     mtp = int(t.get("num_nextn_predict_layers", 0)) > 0 if mtp is None else bool(mtp)
-    rows, d, streams = 64, int(t["hidden_size"]), int(t.get("hc_mult", 4))
+    full = str(t.get("model_type") or "") == "glm_moe_dsa"
+    topk = int(t.get("index_topk", 2048))
+    # full GLM-5.3 has plain residuals (no hc_mult) and a per-token indexer on one layer in four
+    rows, d, streams = 64, int(t["hidden_size"]), int(t.get("hc_mult", 1 if full else 4))
     fixed = linear * (4 * lh * ld * ld * 4 + 3 * (conv - 1) * 3 * lh * ld * 2)
     fixed += linear * rows * (3 * lh * ld + 2 * ld + lh) * 2
     fixed += linear * rows * lh * (12 * ld + 4)
@@ -272,39 +284,52 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
     extent = d * streams + int(t["vocab_size"]) // world + slots * (d + width) + heads * (2 * kd + vd)
     extent += int(t.get("q_lora_rank", d)) * 2 + int(t.get("kv_lora_rank", d)) * 2
     extent += int(t.get("intermediate_size", width)) * 3 // world + int(t.get("index_n_heads", 32)) * index
+    if full:                                   # the per-token selector's token lists and score slabs
+        extent += topk * 4 + int(t.get("index_n_heads", 32)) * 4
     fixed += (2 if mtp else 1) * (16 * rows * extent * 4 + 8 * rows * 16384 * 4)
     # prompt-chunk buffers: at most 5 row extents a row without the head
-    fixed += PREFILL_ROWS * 5 * (extent - int(t["vocab_size"]) // world)
+    fixed += prefill_rows * 5 * (extent - int(t["vocab_size"]) // world)
+    if full:
+        fixed += prefill_rows * topk * 4
     if (t.get("_quantization") or {}).get("quant_method") == "exl3":
         # EXL3 experts' scratch (decode windows, the MTP head's, a prompt chunk) and the prompt's BF16 split-K partials
         fixed += (2 if mtp else 1) * exl3_expert_scratch(rows, slots, d, width)
-        fixed += exl3_expert_scratch(PREFILL_ROWS, slots, d, width) + 8 * PREFILL_ROWS * 16384 * 4
+        fixed += exl3_expert_scratch(prefill_rows, slots, d, width) + 8 * prefill_rows * 16384 * 4
     count = attention + int(mtp)
     lw = int(t.get("kv_lora_rank", 512))
     def bytes_at(capacity: int) -> int:
-        scratch = mla_chunk_scratch(t, world, capacity, latent=latent)
+        scratch = mla_chunk_scratch(t, world, capacity, latent=latent, prefill_rows=prefill_rows)
+        rope = int(t.get("qk_rope_head_dim", 0))
         if latent:
-            # latent cache; a prompt chunk's partials (MLA_PROMPT_ATT_ROWS rows at a time) and absorbed rows (MTP's too)
-            cache = count * capacity * lw * 2
-            dense = min(capacity, minimum_slots) + PREFILL_ROWS
-            scratch += (((dense + 511) // 512) * min(PREFILL_ROWS, MLA_PROMPT_ATT_ROWS) * heads * (lw + 2) * 4
-                        + 4 * PREFILL_ROWS * heads * lw)
+            # latent cache (and full GLM-5.3's shared rotary key part beside it); a prompt chunk's partials
+            # (MLA_PROMPT_ATT_ROWS rows at a time) and absorbed rows (MTP's too)
+            cache = count * capacity * ((lw + rope) * 2 if kv_dtype == "bf16" else lw + rope + 8)
+            dense = min(capacity, minimum_slots) + prefill_rows
+            scratch += (((dense + 511) // 512) * min(prefill_rows, MLA_PROMPT_ATT_ROWS) * heads * (lw + 2) * 4
+                        + 4 * prefill_rows * heads * lw)
+            if full:                           # one owner in four holds a plane; the others hold none
+                owners = sum(1 for k in (t.get("indexer_types") or []) if k == "full") + int(mtp)
+                cache += owners * capacity * (index * 2 + int(t.get("index_n_heads", 32)) * 4)
         else:
             cache = count * capacity * heads * (kd + vd) * 2
             scratch += (2 if mtp else 1) * ((capacity + rows + 511) // 512) * rows * heads * (kd + 2) * 4
-        cache += count * (2 * capacity + capacity // 4 + 2) * index * 2
+        if not full:
+            cache += count * (2 * capacity + capacity // 4 + 2) * index * 2
         return fixed + cache + scratch
     return Geometry(bytes_at, reserve, minimum_slots)
 
 
-def mla_chunk_scratch(t: dict, world: int, capacity: int, *, latent: bool) -> int:
+def mla_chunk_scratch(t: dict, world: int, capacity: int, *, latent: bool, prefill_rows: int = PREFILL_ROWS) -> int:
     """A prompt chunk's transient bytes: token selection (fp32 pool scores, chosen pools, token lists), then sparse attention's partials."""
 
     heads, topk = int(t["num_attention_heads"]) // world, int(t.get("index_topk", 2048))
-    # the fp32 pool scores of at most MLA_SELECT_ROWS rows at once, the chosen pools and token lists of the chunk's
-    select = min(PREFILL_ROWS, MLA_SELECT_ROWS) * 4 * ((capacity + 3) // 4) + PREFILL_ROWS * 16 * (topk + 3)
+    if str(t.get("model_type") or "") == "glm_moe_dsa":     # the per-token selector's fp32 scores and token lists
+        select = min(prefill_rows, 32) * 4 * capacity + prefill_rows * 4 * topk
+    else:
+        # the fp32 pool scores of at most MLA_SELECT_ROWS rows at once, the chosen pools and token lists of the chunk's
+        select = min(prefill_rows, MLA_SELECT_ROWS) * 4 * ((capacity + 3) // 4) + prefill_rows * 16 * (topk + 3)
     if latent:
-        return select + ((topk + 515) // 512) * PREFILL_ROWS * heads * (int(t.get("kv_lora_rank", 512)) + 2) * 4
+        return select + ((topk + 515) // 512) * prefill_rows * heads * (int(t.get("kv_lora_rank", 512)) + 2) * 4
     kd = int(t["qk_nope_head_dim"]) + int(t.get("qk_rope_head_dim", 0))
     return select + 128 * heads * (kd + 2) * 4 * ((topk + 515) // 512)
 

@@ -115,7 +115,8 @@ class FakeDrafter:
 
 def _engine(torch):
     st = SimpleNamespace(cur=[], rec=[torch.zeros(3)], conv=torch.zeros(2), mtp_len=0, mtp_drafted=0, kc=[], vc=[],
-                         index=None, set_pos=lambda n: None, set_mtp_len=lambda n: None)
+                         index=None, latent=False, index_rows=lambda n, m: [],
+                         set_pos=lambda n: None, set_mtp_len=lambda n: None)
     return SimpleNamespace(st=st)
 
 

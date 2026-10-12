@@ -12,6 +12,7 @@ import torch
 from tensorfold.cuda import experts as grouped
 
 from tensorfold.cuda.exl3.experts import Exl3RoutedExperts as Exl3Experts
+from .. import glm53
 from . import latent
 from .qmm import B16, Q4, as_i32, make_b16, make_q4, quantize4, stack_b16, stack_q4
 
@@ -65,6 +66,19 @@ class Config:
     group_size: int
     bits: int
     quant: str = "mlx"         # "mlx" (affine 4-bit everywhere) or "exl3" (EXL3 routed experts, BF16 elsewhere)
+    # GLM-5.3 (glm_moe_dsa) only, defaults keep GLM-5.3-Flash unchanged. It rotates a 64-wide key part: kv_b_proj's
+    # key rows are heads * qk_nope (not qk_dim), and the rotary dimensions come from kv_a_proj_with_mqa's tail and
+    # are shared by every head. ``index_full``: the layers whose own indexer weights are loaded, the others reuse
+    # their block's selection.
+    qk_nope: int = 0
+    qk_rope: int = 0
+    rope_theta: float = 10000.0
+    rope_interleave: bool = True
+    indexer_interleave: bool = True
+    index_stride: int = 1
+    index_skip: int = 0
+    index_full: tuple[int, ...] = ()
+    full: bool = False         # True: full GLM-5.3 (all sparse MLA, plain residual, EXL3 on every linear)
 
     @classmethod
     def read(cls, model_dir: str | Path) -> "Config":
@@ -74,6 +88,8 @@ class Config:
             raise ValueError(f"tensorfold_activation_dtype {want!r}: bfloat16 or float32")
         if want == "float32":
             raise ValueError("tensorfold_activation_dtype float32 is the Mac engine; the CUDA engine stays bf16")
+        if glm53.is_full(raw):
+            return cls.from_full(raw)
         t = dict(raw.get("text_config") or raw)
         lin = dict(t.get("linear_attn_config") or {})
         quant = raw.get("quantization") or raw.get("quantization_config") or {}
@@ -105,11 +121,46 @@ class Config:
             bits=bits_of(quant), quant=str(quant.get("quant_method") or "mlx").lower(),
         )
 
+    @classmethod
+    def from_full(cls, raw: dict) -> "Config":
+        """Full GLM-5.3 (``glm_moe_dsa``): every layer sparse MLA, a rotary key part, plain residuals, EXL3 throughout."""
+
+        f = glm53.fields(raw)
+        sched = glm53.schedule(f)
+        return cls(
+            hidden=f["hidden"], layers=f["layers"], vocab=f["vocab"], eps=f["eps"], heads=f["heads"],
+            q_lora=f["q_lora"], kv_lora=f["kv_lora"], qk_dim=f["qk_nope"] + f["qk_rope"], v_dim=f["v_dim"],
+            qk_nope=f["qk_nope"], qk_rope=f["qk_rope"], rope_theta=f["rope_theta"],
+            rope_interleave=f["rope_interleave"], indexer_interleave=f["indexer_interleave"],
+            lin_heads=f["lin_heads"], lin_dim=f["lin_dim"], conv=f["conv"], lower=f["lower"],
+            experts=f["experts"], top_k=f["top_k"], moe_width=f["moe_width"], shared_width=f["shared_width"],
+            dense_width=f["dense_width"], routed_scale=f["routed_scale"], norm_topk=f["norm_topk"],
+            streams=f["streams"], hc_iters=f["hc_iters"], hc_eps=f["hc_eps"],
+            index_heads=f["index_heads"], index_dim=f["index_dim"], index_topk=f["index_topk"],
+            kpool=f["kpool"], index_stride=f["index_stride"], index_skip=f["index_skip"],
+            index_full=tuple(sched.full),
+            limit=f["limit"], kinds=f["kinds"], mlp_kinds=f["mlp_kinds"], eos=f["eos"],
+            mtp_layers=f["mtp_layers"], group_size=0, bits=0, quant="exl3", full=True,
+        )
+
     @property
     def dense_limit(self) -> int:
         """Largest context (tokens) where DSA's top-k selection keeps every visible key (dense attention)."""
 
         return self.index_topk + self.kpool - 1
+
+    @property
+    def kv_a_width(self) -> int:
+        """``kv_a_proj_with_mqa``'s output width: the latent plus a rotary key part, padded to a 128 block."""
+
+        want = self.kv_lora + self.qk_rope
+        return -(-want // 128) * 128
+
+    @property
+    def latent_width(self) -> int:
+        """The width of an attention cache row: the latent, then the rotary key part (which every head shares)."""
+
+        return self.kv_lora + self.qk_rope
 
 
 @dataclass
@@ -146,14 +197,18 @@ class KDAW:
 
 @dataclass
 class IndexW:
-    """Replicated DSA indexer weights include key and query projections, head weights, key LayerNorm, pool gates, and pool position bias."""
+    """Replicated DSA indexer weights: key and query projections, head weights and the key LayerNorm.
+
+    ``gate`` and ``ape`` are GLM-5.3-Flash's pooled selection (``index_kpool_compress``); full GLM-5.3 has neither.
+    """
 
     kw: Q4
     qb: Q4
     ln_w: torch.Tensor
     ln_b: torch.Tensor
-    gate: torch.Tensor
-    ape: torch.Tensor
+    gate: torch.Tensor | None = None
+    ape: torch.Tensor | None = None
+    wproj: Q4 | None = None     # GLM-5.3: the indexer's head weights from the hidden state (Flash: a pool gate)
 
 
 @dataclass
@@ -222,6 +277,9 @@ class Weights:
     comm: Any = None
     meta: dict = field(default_factory=dict)
     draft_head: Q4 | None = None      # BF16 heads: a 4-bit copy the draft steps read (drafts only propose)
+    # GLM-5.3 only: the rotary frequencies of the key part (fp32 [qk_rope / 2] each), and of the indexer's own keys
+    inv_freq: torch.Tensor | None = None
+    index_inv_freq: torch.Tensor | None = None
 
     @property
     def vocab_offset(self) -> int:
@@ -440,7 +498,8 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
             mtpw = MTPW(t(f"layers.{i}.enorm.weight"), t(f"layers.{i}.hnorm.weight"), q4(f"layers.{i}.eh_proj"),
                         t(f"layers.{i}.shared_head.norm.weight"), layer(i, plain=True))
         w = Weights(cfg, embed, built, t("norm.weight"), head, mtpw, rank, world, dev, draft_head=draft_head)
-        w.meta.update(layers=which)
+        # this checkpoint's kernels are MLX Q4 and BF16: the Q4 MMA path reads the 64-group row sums (forward.sums)
+        w.meta.update(layers=which, norm_sums=True)
     finally:
         rd.close()
     torch.cuda.empty_cache()

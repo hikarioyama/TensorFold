@@ -1,12 +1,14 @@
-"""GLM-5.3-Flash (model_type ``glm5_next``): an MLX engine on a 256 GB Mac, a CUDA engine over two DGX Sparks."""
+"""GLM-5.3-Flash (``glm5_next``) and GLM-5.3 (``glm_moe_dsa``): the Flash family's MLX/CUDA engines, plus the full model's EXL3 CUDA engine."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
 
-MODEL_TYPES = ("glm5_next",)
-TITLE = "GLM-5.3-Flash"
+# glm_moe_dsa is full GLM-5.3: the same family folder, its own loader/engine (glm53, weights53, cuda/forward's
+# EXL3 paths) selected by ``_is_full``/``cuda_engine`` once the config says so
+MODEL_TYPES = ("glm5_next", "glm_moe_dsa")
+TITLE = "GLM-5.3-Flash / GLM-5.3"
 LANES = True
 # 4-bit weights in groups of 64 with the MTP layer kept; the EXL3 checkpoint is the CUDA engine's alone
 MODELS = ("TensorFold/GLM-5.3-Flash-MLX-4bit-MTP", "Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw")
@@ -17,6 +19,7 @@ KERNEL_DEPENDENCIES = ("tensorfold.kernels.qwen.flash_next.v1.prefill_mm",)
 KERNEL_VERSION = "v1"
 # the storage formats each engine reads: MLX affine on a Mac; that or EXL3 routed experts on CUDA
 QUANT_METHODS = {"mlx": ("mlx",), "cuda": ("mlx", "exl3")}
+CUDA_KV_DTYPES = ("bf16", "fp8")  # FP8: full glm_moe_dsa latent cache only
 CUDA_TP4 = True                    # --tp 4: the CUDA engine splits over four ranks
 # the EXL3 variant the CUDA kernels read (4-bit trellis, the "mcg" codebook, routed experts only)
 EXL3_VARIANT = {"bits": 4, "codebook": "mcg", "scope": "glm53_routed_experts_only"}
@@ -28,6 +31,23 @@ def _mac_reads(fmt: tuple) -> bool:
     from tensorfold.families.glm5_next.config import BITS, GROUPS
 
     return fmt[0] in BITS and fmt[1] in GROUPS
+
+
+def _is_full(model_dir: str | Path) -> bool:
+    """Whether a folder is full GLM-5.3 (``glm_moe_dsa``); a folder whose config cannot be read stays Flash's path.
+
+    The CLI's checks run before any engine exists, and a missing or broken config.json is that engine's to report.
+    """
+
+    import json
+
+    from . import glm53
+
+    try:
+        raw = json.loads((Path(model_dir) / "config.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return glm53.is_full(raw)
 
 
 def check(model_dir: str | Path) -> None:
@@ -44,6 +64,18 @@ def check(model_dir: str | Path) -> None:
     if want == "float32" and sys.platform != "darwin":
         raise ValueError("tensorfold_activation_dtype float32 is the Mac engine; the CUDA engine stays bf16")
     method = quant_method(config)
+
+    if method == "exl3" and _is_full(model_dir):
+        # GLM-5.3 (glm_moe_dsa): EXL3 on every linear, mixed 3/4/5/6 bits, the mul1 codebook, a BF16 head. The loader
+        # reads each group's width from its headers, so this only has to refuse another codebook.
+        found = config.get("quantization_config") or config.get("quantization") or {}
+        if str(found.get("codebook")) != "mul1":
+            raise ValueError(f"GLM-5.3's CUDA engine reads the mul1 EXL3 codebook of {MODELS[1]}-style exports; this "
+                             f"checkpoint has codebook {found.get('codebook')!r}. {OWN_MODEL_HELP}")
+        print("[tensorfold] GLM-5.3 (glm_moe_dsa) on CUDA: EXL3 on every linear, mixed bit widths from the tensor "
+              "headers, MTP speculation only; replies are exact but the engine is still being brought up",
+              flush=True)
+        return
     if method == "exl3":
         # the CUDA engine's layout; the Mac engine refuses it before this through QUANT_METHODS (require_readable)
         found = config.get("quantization_config") or config.get("quantization") or {}
@@ -205,8 +237,36 @@ CUDA_QUANTIZATION = (4, 64)
 
 def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: int = 0, master: str = "",
                 master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None, **options: Any):
-    """Build the two-rank engine with adaptive drafting, reusable prompt state, or serial decoding when drafts are disabled."""
+    """Build the multi-rank engine with MTP drafting, reusable prompt state, or serial decoding when drafts are off."""
 
+    full = _is_full(model_dir)
+    kv_dtype = options.get("kv_dtype", "bf16")
+    if kv_dtype not in CUDA_KV_DTYPES or (kv_dtype != "bf16" and not full):
+        raise ValueError("FP8 KV cache is supported only by full GLM-5.3, not Flash")
+    if full:
+        # CUDA auto remains one; explicit parallel uses the shared Scheduler adapter.
+        parallel = options.get("parallel", 1)
+        parallel = 1 if parallel in (None, "auto") else int(parallel)
+        if not 1 <= parallel <= 4:
+            raise ValueError("GLM-5.3 supports at most 4 active requests; --parallel must be in 1..4")
+        # GLM-5.3 (glm_moe_dsa): one rank or the whole TP=4 box; its speculation is its own MTP head, never DFlash2
+        if int(tp) not in (1, 2, 4):
+            raise ValueError(f"GLM-5.3 (glm_moe_dsa) runs over --tp 1, 2 or 4 ranks, not {int(tp)}")
+        if int(tp) > 1 and not master:
+            raise ValueError("--tp 2/4 needs --master: rank 0's address on the link between the ranks")
+        if drafter:
+            raise ValueError("GLM-5.3 (glm_moe_dsa) drafts with its own MTP head: serve it with --drafter none "
+                             "(its layers are not DFlash2's)")
+        from .cuda.engine import DEFAULT_POLICY, GlmEngine
+
+        if mtp_drafts is None:
+            policy = DEFAULT_POLICY
+        else:
+            policy = str(int(mtp_drafts))
+        return GlmEngine(Path(model_dir), rank=int(rank), master=master or "127.0.0.1", port=int(master_port),
+                         policy=policy, drafter=None, context=options.get("context"),
+                         context_explicit=options.get("context_explicit"), serial_only=bool(no_drafts),
+                         world=int(tp), parallel=parallel, kv_dtype=kv_dtype)
     if int(tp) not in (2, 4):
         raise ValueError("GLM-5.3-Flash needs two GPUs, one per machine: run the same `tensorfold serve` command "
                          "with --tp 2/4 --rank R --master ADDRESS on both (non-zero ranks first)")

@@ -13,6 +13,8 @@ active = False                     # set only around prefill chunks
 totals: dict[str, float] = {}
 peaks: dict[str, int] = {}         # the most memory a block allocated on top of what was live before it
 
+events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+
 
 @contextmanager
 def timed(name: str):
@@ -29,13 +31,39 @@ def timed(name: str):
     peaks[name] = max(peaks.get(name, 0), torch.cuda.max_memory_allocated() - before)
 
 
-def report(tokens: int) -> None:
-    if not ENABLED or not totals:
+
+@contextmanager
+def stream_timed(name: str):
+    """Stream-local child timing; never synchronize away shared/routed overlap."""
+    if not (ENABLED and active):
+        yield
         return
-    total = sum(v for k, v in totals.items() if ":" not in k)          # "dsa: x" parts are inside "dsa (total)"
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    try:
+        yield
+    finally:
+        end.record()
+        events.append((name, start, end))
+
+
+def report(tokens: int) -> None:
+    if not ENABLED:
+        return
+    if events:
+        torch.cuda.synchronize()
+        for name, start, end in events:
+            totals[name] = totals.get(name, 0.0) + start.elapsed_time(end) / 1000
+        events.clear()
+    if not totals:
+        return
+    # "dsa: x" parts are inside "dsa (total)", where that marker exists (the plain path has no such wrapper)
+    total = sum(v for k, v in totals.items() if ":" not in k) or sum(totals.values())
     parts = ", ".join(f"{k} {v:.2f}s ({100 * v / total:.0f}%)" for k, v in sorted(totals.items(), key=lambda kv: -kv[1]))
     print(f"[tensorfold] prefill profile, {tokens} tokens in {total:.1f}s timed ({tokens / total:.0f} tok/s): {parts}",
           flush=True)
+    print("[tensorfold] profile timing: EXL3 MoE children use stream-local CUDA events (may overlap); "
+          "other tags use synchronized wall time; child sums are not additive wall time", flush=True)
     big = ", ".join(f"{k} {v / 2**30:.2f}" for k, v in sorted(peaks.items(), key=lambda kv: -kv[1])[:6])
     print(f"[tensorfold] prefill memory (GiB): allocated {torch.cuda.memory_allocated() / 2**30:.1f}, reserved "
           f"{torch.cuda.memory_reserved() / 2**30:.1f}; most a block added: {big}", flush=True)

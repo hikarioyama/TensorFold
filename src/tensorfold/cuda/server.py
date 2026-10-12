@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 from tensorfold.engine import grammar
 from tensorfold.server.cancellation import RequestCancelled
+from tensorfold.server.text import think_markers as _think_markers
 from tensorfold.server.errors import CONTEXT_LIMIT, RequestError, refusal
 from tensorfold.server.messages import validate_modalities
 from tensorfold.server.probabilities import TokenBytes, probability_options
@@ -38,6 +39,13 @@ from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
 _MADE = threading.Lock()                # guards the lazily made per-app ``Turns``
 
 _SAMPLING_FIELDS = ("temperature", "top_p", "top_k", "min_p", "seed")
+
+
+# a checkpoint whose template always opens a thought block gets this many reply tokens for it when the client asked
+# for none, so the answer itself still arrives inside max_tokens
+DEFAULT_FORCED_THINK_BUDGET = 1024
+# templates that open the thought block themselves (GLM-5.3's writes `` thinking`` right after ``<|assistant|>``)
+FORCED_THINK_OPENERS = (" thinking", " thinking")
 
 
 @dataclass(slots=True)
@@ -243,11 +251,18 @@ class App:
         kwargs.pop("enable_thinking", None)
         kwargs.pop("reasoning_effort", None)
         thinking = bool(fields.get("enable_thinking", self.default_thinking))
+        forced = False
+        if chat and not thinking and not getattr(self.template, "thinking_switch", True):
+            # the checkpoint's template opens the thought block by itself (GLM-5.3's always does): the prompt decides,
+            # or the whole thought comes back as the answer
+            thinking, forced = True, True
         effort = heard_effort(fields.get("reasoning_effort"), getattr(self, "reasoning_effort", None), levels)
         if thinking and effort:
             kwargs["reasoning_effort"] = effort
         budget = parse_numbers({"thinking_budget": body.get("thinking_budget")})["thinking_budget"]
         budget = int(budget or getattr(self, "thinking_budget", 0)) if chat and thinking else 0     # 0: the default
+        if forced and not budget:                     # leave the answer room inside the client's max_tokens
+            budget = min(DEFAULT_FORCED_THINK_BUDGET, max(128, int(max_tokens or 0) // 3))
         spec = grammar.request_spec(body)
         top = probability_options(body, supported=bool(getattr(self.engine, "supports_logprobs", False)))
         if top is not None:
@@ -274,11 +289,18 @@ class App:
                                           lambda messages: render(messages, allow_images=True),
                                           context_limit=self._context_limit(),
                                           limits=getattr(self, "image_limits", DEFAULT_LIMITS))
+                if not thinking:
+                    thinking, budget = self.honour_forced_thinking(rendered.tokens, thinking, budget)
                 return PreparedRequest(rendered.tokens, max_tokens, tools, thinking,
                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
                                        vision=rendered.vision, grammar=compiled, think_budget=budget)
             text = render(body["messages"])
+            if chat and not thinking and not getattr(self.template, "thinking_switch", True):
+                # the template cannot honour "no thinking": drop the effort line it forces, so the model answers
+                # directly instead of rambling through a thought the server would have to hand back as the answer
+                text = self.template.without_effort_system(text)
             prompt = self.tok.encode(text, add_special_tokens=False).ids
+            thinking, budget = self.honour_forced_thinking(prompt, thinking, budget)
         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
             prompt = self.token_ids(body["prompt"])
         else:
@@ -291,6 +313,44 @@ class App:
         # sampling is resolved here, so a malformed control is refused before a stream opens
         return PreparedRequest(prompt, max_tokens, tools, thinking, self.sampling_for(body, prompt),
                                ignore_eos=ignore_eos, stop=stop, grammar=compiled, think_budget=budget)
+
+    def prompt_forces_thinking(self, prompt: list[int], thinking: bool) -> bool:
+        """Whether the rendered chat prompt opens a thought block itself, whatever the client asked for.
+
+        A template that never mentions ``enable_thinking`` cannot honour the switch: GLM-5.3's always ends its
+        assistant prefix with the tokenizer's own `` opener token. The prompt, not the request, decides, and a
+        server that ignores this hands the whole thought back as the answer.
+        """
+
+        if thinking or not prompt:
+            return thinking
+        if getattr(self.template, "thinking_switch", True):
+            return False                             # the template honours the switch: the client's word stands
+        piece = self.piece(prompt[-1])
+        return piece.startswith("<") and "think" in piece.lower()     # the template's own opener token
+
+    def piece(self, token: int) -> str:
+        """One token's text from either tokenizer kind the server may hold (the Rust one at serve time)."""
+
+        for name in ("id_to_token", "convert_ids_to_tokens"):
+            lookup = getattr(self.tok, name, None)
+            if lookup is None:
+                continue
+            try:
+                got = lookup(token) if name == "id_to_token" else lookup([token])
+            except Exception:                        # noqa: BLE001  a tokenizer without the lookup: try the other
+                continue
+            text = got if isinstance(got, str) else (got[0] if got else "")
+            if text:
+                return str(text).replace("\u200b", "").strip()
+        return ""
+
+    def honour_forced_thinking(self, prompt: list[int], thinking: bool, budget: int) -> tuple[bool, int]:
+        """(thinking, budget) after the prompt's own format: a forced block gets a budget so the answer still fits."""
+
+        if thinking or not self.prompt_forces_thinking(prompt, thinking):
+            return thinking, budget
+        return True, (budget or DEFAULT_FORCED_THINK_BUDGET)
 
     def token_ids(self, value: Any, field: str = "prompt") -> list[int]:
         """Token ids as a request gives them (a list, or a list holding one list); RequestError outside the
@@ -411,6 +471,17 @@ class App:
         stopped = {"client": False, "stop": False}
         failed: list[Exception] = []
         stream = StreamDecoder(self.tok, ends)
+        trace_ids = bool(body.get("stream") and body.get("return_token_ids"))
+
+        def token_trace(new: list[int], *, finished: bool = False) -> dict[str, Any]:
+            # Diagnostic provenance, NOT a visible-token count. The client must align the
+            # original IDs to the text channels and exclude EOS, held text and hidden markup.
+            return {"version": 1, "start": len(out) - len(new), "ids": list(new),
+                    "generated": len(out), "decoded": len(stream.ids) if finished else stream.read,
+                    "raw_chars": len(stream.final() if finished else stream.text),
+                    "visible_chars": dict(sent), "eos_ids": list(ends),
+                    "thinking": bool(chat and thinking), "tools": bool(tools), "final": finished}
+
         # calls stream as argument deltas while written (as on the Mac); one-call requests keep the end parser
         calls_stream = ToolCallStreamer(tools) if tools and not policy.single else None
         answer_raw = [""]
@@ -456,6 +527,8 @@ class App:
                 if len(answer) > sent["content"]:
                     delta["content"] = answer[sent["content"]:]
                     sent["content"] = len(answer)
+                if trace_ids:
+                    delta["_token_trace"] = token_trace(new)
                 if delta and not emit(delta):
                     stopped["client"] = True
                 if calls_stream is not None and not stopped["client"]:
@@ -553,6 +626,10 @@ class App:
         tail = content[sent["content"]:] if content.startswith(answer[:sent["content"]]) else ""
         if tail:
             final["content"] = tail
+        if trace_ids:
+            sent["reasoning"] += len(final.get("reasoning_content", ""))
+            sent["content"] += len(final.get("content", ""))
+            final["_token_trace"] = token_trace([], finished=True)
         finish = "tool_calls" if calls else ("stop" if stopped["stop"] or (out and out[-1] in ends) else "length")
         warning = unanswered(finish, chat and thinking, content, calls)
         if warning:

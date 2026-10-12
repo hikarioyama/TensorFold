@@ -34,11 +34,32 @@ class ChatTemplate:
         env.globals["raise_exception"] = raise_exception
         env.globals["strftime_now"] = lambda fmt: datetime.now().strftime(fmt)
         self.template = env.from_string(source)
+        # GLM-5.3's template never mentions ``enable_thinking``: it always opens the thought block itself, so a
+        # request that asks for no thinking cannot be honoured by the prompt (the server would hand the thought back
+        # as the answer). The server reads this and treats such a reply as thinking.
+        self.thinking_switch = "enable_thinking" in source
         self.efforts = effort_levels(source)          # the reasoning efforts it names (the Mac reads the same ones)
         self.specials = {k: (v.get("content") if isinstance(v, dict) else v)
                          for k, v in cfg.items() if k in ("bos_token", "eos_token", "pad_token", "unk_token")}
         self.late_system = late_system_role(
             lambda messages: self.template.render(**self.specials, messages=messages, add_generation_prompt=False))
+
+    @staticmethod
+    def without_effort_system(text: str) -> str:
+        """The rendered prompt without the ``<|system|>Reasoning Effort: …`` segment its template prepends.
+
+        GLM-5.3's template writes that line for every request and cannot drop it through a parameter. Measured on this
+        checkpoint, the line puts the model into a rambling thought instead of an answer (the same prompt without it
+        answers directly), so a client that asked for no thinking gets a prompt without it.
+        """
+
+        at = text.find("<|system|>Reasoning Effort:")
+        if at < 0 or at > 64:                              # only the leading segment the template always writes
+            return text
+        after = text.find("<|user|>", at)
+        if after < 0:
+            after = text.find("<|system|>", at + 1)
+        return text[:at] + text[after:] if after > 0 else text
 
     def render(self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None,
                enable_thinking: bool, extra: dict[str, Any] | None = None, allow_images: bool = False) -> str:

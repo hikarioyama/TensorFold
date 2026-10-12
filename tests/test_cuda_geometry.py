@@ -160,6 +160,7 @@ def test_mla_actual_cache_and_replay_state_are_budgeted(monkeypatch, allocations
     cfg = SimpleNamespace(heads=8, lin_heads=8, conv=4, qk_dim=256, v_dim=256, index_dim=128,
                           hidden=512, streams=4, q_lora=512, kv_lora=512, index_heads=32,
                           dense_width=1024, top_k=2, moe_width=512, experts=8, quant="mlx")
+    cfg.qk_rope, cfg.kv_a_width, cfg.full = 0, cfg.kv_lora, False     # Flash: NoPE MLA, no EXL3-everywhere
     layers = [SimpleNamespace(index=i, kind="kda" if i % 2 == 0 else "dsa",
                               kda=SimpleNamespace(proj=SimpleNamespace(n=3 * 4 * 128 + 256 + 4))) for i in range(4)]
     weights = SimpleNamespace(cfg=cfg, world=2, device="cpu", layers=layers, meta={"long_context": True},
@@ -192,6 +193,7 @@ def test_mla_prompt_chunk_latent_partials_hold_one_row_block(monkeypatch, alloca
     cfg = SimpleNamespace(heads=64, lin_heads=8, conv=4, qk_dim=256, v_dim=256, index_dim=128, hidden=512, streams=4,
                           q_lora=512, kv_lora=512, index_heads=32, dense_width=1024, top_k=2, moe_width=512, experts=8,
                           quant="mlx")
+    cfg.qk_rope, cfg.kv_a_width, cfg.full = 0, cfg.kv_lora, False     # Flash: NoPE MLA, no EXL3-everywhere
     layers = [SimpleNamespace(index=i, kind="kda" if i % 2 == 0 else "dsa",
                               kda=SimpleNamespace(proj=SimpleNamespace(n=3 * 4 * 128 + 256 + 4))) for i in range(4)]
     weights = SimpleNamespace(cfg=cfg, world=2, device="cpu", layers=layers, meta={}, mtp=None,
@@ -257,6 +259,7 @@ def test_mla_exl3_scratch_and_buffers_are_budgeted(monkeypatch, allocations, mtp
     cfg = SimpleNamespace(heads=64, lin_heads=64, conv=4, qk_dim=256, v_dim=256, index_dim=128, hidden=4096,
                           streams=4, q_lora=1536, kv_lora=512, index_heads=32, dense_width=12288, top_k=8,
                           moe_width=2048, shared_width=2048, experts=288, quant="exl3")
+    cfg.qk_rope, cfg.kv_a_width, cfg.full = 0, cfg.kv_lora, False     # Flash: NoPE MLA, no EXL3-everywhere
     layers = [SimpleNamespace(index=i, kind="kda" if i % 2 == 0 else "dsa",
                               kda=SimpleNamespace(proj=SimpleNamespace(n=3 * 32 * 128 + 256 + 32))) for i in range(4)]
     weights = SimpleNamespace(cfg=cfg, world=2, device="cpu", layers=layers, meta={"long_context": True},
@@ -307,3 +310,35 @@ def test_flash_message_snapshot_budget_counts_actual_saved_tensors(world, mtp):
         low = geometry.indexed_stream_geometry(text, 2, 4, 2, mtp=mtp).bytes_at(32)
         high = geometry.indexed_stream_geometry(text, 2, 4, 8, mtp=mtp).bytes_at(32)
         assert high - low == 6 * saved
+
+
+@pytest.mark.torch
+@pytest.mark.parametrize("cap", [2560, 32768, 131592])
+@pytest.mark.parametrize("prompt_rows", [128, 2048])
+def test_full_glm_fp8_actual_allocations_fit_prefill_geometry(monkeypatch, allocations, cap, prompt_rows):
+    arrays, fake = allocations
+    mod = importlib.import_module("tensorfold.families.glm5_next.cuda.forward")
+    modules = [mod, mod.cache_fp8, mod.latent, mod.kda_mod,
+               importlib.import_module("tensorfold.cuda.exl3.experts")]
+    for m in modules:
+        monkeypatch.setattr(m, "torch", fake)
+    monkeypatch.setattr(mod.latent, "ENABLED", True)
+    t = dict(model_type="glm_moe_dsa", hidden_size=6144, num_attention_heads=64, num_hidden_layers=78,
+             qk_nope_head_dim=192, qk_rope_head_dim=64, v_head_dim=256, vocab_size=154880,
+             q_lora_rank=2048, kv_lora_rank=512, intermediate_size=12288, moe_intermediate_size=2048,
+             num_experts_per_tok=8, n_routed_experts=256, index_n_heads=32, index_head_dim=128,
+             num_nextn_predict_layers=1, indexer_types=["full"]*22+["shared"]*56,
+             _quantization={"quant_method":"exl3"})
+    c = SimpleNamespace(heads=64, lin_heads=64, conv=4, qk_dim=256, v_dim=256, index_dim=128, hidden=6144,
+                        streams=1, q_lora=2048, kv_lora=512, index_heads=32, dense_width=12288, top_k=8,
+                        moe_width=2048, shared_width=2048, experts=256, quant="exl3", layers=78,
+                        qk_rope=64, kv_a_width=576, full=True, index_topk=2048)
+    w = SimpleNamespace(cfg=c, world=4, device="cpu", layers=[SimpleNamespace(index=i,kind="dsa") for i in range(78)],
+                        meta=dict(long_context=True,kv_dtype="fp8",index_source=list(range(22))+[21]*56,index_full=tuple(range(22))),
+                        mtp=SimpleNamespace(),head=SimpleNamespace(n=154880//4))
+    for rows in (8,8,32,32):
+        mod.Buffers(w,rows,cap)
+    mod.Buffers(w,prompt_rows,cap,prefill=True)
+    mod.State(w,cap,8)
+    g=geometry.mla_geometry(t,4,8,latent=True,kv_dtype="fp8",prefill_rows=prompt_rows)
+    assert bytes_in(arrays) <= g.bytes_at(cap), (bytes_in(arrays),g.bytes_at(cap))

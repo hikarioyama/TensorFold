@@ -173,8 +173,9 @@ def test_serve_parses_the_kv_cache_flag():
     assert cli.build_parser().parse_args(["serve", "owner/model", "--kv-dtype", "int8"]).kv_dtype == "int8"
     assert cli.build_parser().parse_args(["serve", "owner/model", "--kv-dtype", "int4"]).kv_dtype == "int4"
     assert cli.build_parser().parse_args(["serve", "owner/model", "--mtp-confidence", "0.6"]).mtp_confidence == 0.6
+    assert cli.build_parser().parse_args(["serve", "owner/model", "--kv-dtype", "fp8"]).kv_dtype == "fp8"
     with pytest.raises(SystemExit):
-        cli.build_parser().parse_args(["serve", "owner/model", "--kv-dtype", "fp8"])
+        cli.build_parser().parse_args(["serve", "owner/model", "--kv-dtype", "fp3"])
 
 
 @pytest.mark.torch

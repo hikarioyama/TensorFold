@@ -80,6 +80,89 @@ def refuse_small_gpu(need: tuple[int, int] = FLASHNEXT_FLOOR) -> None:
                              "of those, on the MLX backend, or with another model.")
 
 
+def _unbundled_math_includes() -> list[str]:
+    """Where torch's ``ATen/cuda`` finds the math headers when the toolkit has none: CUDA 13 moved them into the ``nvidia`` wheels.
+
+    ``ATen/cuda/CUDAContextLight.h`` includes ``<cusparse.h>`` and ``<cusolverDn.h>``, which CUDA 13's toolkit image no
+    longer ships, so any kernel that includes ``ATen/cuda/CUDAContext.h`` (for ``at::cuda::getCurrentCUDAStream``) fails
+    to compile without them. Only headers the toolkit **lacks** are linked into a shim directory: the wheel also
+    carries a whole newer CUDA tree (nvcc 13.3 beside a 13.0 toolkit), and putting that on the include path shadows
+    the toolkit's own ``crt/`` headers and breaks nvcc's generated stubs (``__cudaLaunch`` undeclared). Empty when the
+    toolkit has everything, so a complete installation builds unchanged.
+    """
+
+    import glob
+    from pathlib import Path
+
+    toolkit = [Path(os.environ.get("CUDA_HOME") or "/usr/local/cuda") / "include", Path("/usr/local/cuda/include")]
+    have = {p.name for base in toolkit if base.is_dir() for p in base.glob("*.h")}
+    if {"cusparse.h", "cusolverDn.h"} <= have:
+        return []
+    found: list[Path] = []
+    for root in ("/usr/local/lib", "/usr/lib", "/usr/local/cuda"):
+        for pattern in ("python*/dist-packages/nvidia/*/include", "python*/site-packages/nvidia/*/include",
+                        "python*/dist-packages/nvidia/*/include/cuda"):
+            for path in glob.glob(os.path.join(root, pattern)):
+                found += [p for p in Path(path).glob("*.h") if p.name not in have]
+    if not found:
+        return []
+    shim = Path(os.environ.get("TORCH_EXTENSIONS_DIR") or "/tmp") / "tensorfold_unbundled"
+    shim.mkdir(parents=True, exist_ok=True)
+    for source in found:
+        target = shim / source.name
+        if not target.exists():
+            target.symlink_to(source)
+    return [str(shim)]
+
+
+@lru_cache(maxsize=1)
+def _nvcc_host_limit() -> int | None:
+    """The newest g++ nvcc accepts, read from its own ``crt/host_config.h`` (None: the header names no limit)."""
+
+    import re
+
+    home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH") or "/usr/local/cuda"
+    try:
+        text = (Path(home) / "include" / "crt" / "host_config.h").read_text()
+    except OSError:
+        return None
+    found = re.search(r"unsupported GNU version! gcc versions later than (\d+)", text)
+    return int(found.group(1)) if found else None
+
+
+@lru_cache(maxsize=1)
+def _host_compiler() -> str | None:
+    """A ``-ccbin`` for nvcc when this container's default g++ is newer than nvcc's check allows.
+
+    CUDA 13 stops at gcc 15 and this image ships gcc 16, which nvcc refuses before compiling anything (the kernels
+    would build with ``-allow-unsupported-compiler``, but a supported g++ of the same install is the honest choice).
+    """
+
+    import re
+    import shutil
+    import subprocess
+
+    limit = _nvcc_host_limit()
+    if limit is None:
+        return None
+    cxx = os.environ.get("CXX") or shutil.which("g++") or ""
+    if "clang" in cxx:
+        return None
+    try:
+        out = subprocess.run([cxx, "-dumpfullversion"], capture_output=True, text=True, timeout=10).stdout.strip()
+        parts = re.findall(r"\d+", out)
+        major = int(parts[0]) if parts else 0
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if 0 < major <= limit:
+        return None
+    for candidate in range(limit, 9, -1):
+        found = shutil.which(f"g++-{candidate}")
+        if found:
+            return found
+    return None
+
+
 def load(name: str, sources: str | list[str], need: tuple[int, int] = MIN_CAPABILITY, *, arch_specific: bool = False,
          **kwargs: Any) -> Any:
     """torch's JIT ``load`` for this GPU only (NVIDIA's containers list every architecture back to sm_80), with a line when it compiles or waits on a lock."""
@@ -87,6 +170,12 @@ def load(name: str, sources: str | list[str], need: tuple[int, int] = MIN_CAPABI
     from torch.utils import cpp_extension
 
     kwargs["extra_cuda_cflags"] = [*kwargs.get("extra_cuda_cflags", []), *arch_flags(need, arch_specific)]
+    host = _host_compiler()
+    if host:
+        kwargs["extra_cuda_cflags"].append(f"-ccbin={host}")
+    math = _unbundled_math_includes()
+    if math:                                            # torch's ATen/cuda needs cusparse.h; CUDA 13 hides it in the wheels
+        kwargs["extra_include_paths"] = [*math, *kwargs.get("extra_include_paths", [])]
     links = _toolkit()
     if links:
         kwargs["extra_ldflags"] = [*kwargs.get("extra_ldflags", []), *links]
