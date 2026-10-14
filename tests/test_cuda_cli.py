@@ -169,13 +169,13 @@ def test_the_prompt_precision_is_set_before_loading_and_shown(tmp_path, monkeypa
 
 def test_serve_parses_the_kv_cache_flag():
     plain = cli.build_parser().parse_args(["serve", "owner/model"])
-    assert plain.kv_dtype == "bf16"                        # the cache stays bf16 unless it is asked for
+    assert plain.kv_dtype is None                         # unset: each family picks its own cache dtype
     assert cli.build_parser().parse_args(["serve", "owner/model", "--kv-dtype", "int8"]).kv_dtype == "int8"
     assert cli.build_parser().parse_args(["serve", "owner/model", "--kv-dtype", "int4"]).kv_dtype == "int4"
     assert cli.build_parser().parse_args(["serve", "owner/model", "--mtp-confidence", "0.6"]).mtp_confidence == 0.6
     assert cli.build_parser().parse_args(["serve", "owner/model", "--kv-dtype", "fp8"]).kv_dtype == "fp8"
     with pytest.raises(SystemExit):
-        cli.build_parser().parse_args(["serve", "owner/model", "--kv-dtype", "fp3"])
+        cli.build_parser().parse_args(["serve", "owner/model", "--kv-dtype", "bogus"])
 
 
 @pytest.mark.torch

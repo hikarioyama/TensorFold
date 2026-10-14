@@ -71,11 +71,11 @@ def check(args: argparse.Namespace, family: Any, backend: str, config_dir: Any =
                          "a round after each 1,024 prompt rows")
     if share is not None and share < 0:
         raise ValueError(f"--decode-share is 0 (whole prompts first) or more, not {share}")
-    kv = getattr(args, "kv_dtype", "bf16")
-    if kv != "bf16" and backend != "cuda":
+    kv = getattr(args, "kv_dtype", None)                 # None: the family picks its own default
+    if kv is not None and kv != "bf16" and backend != "cuda":
         raise ValueError(f"--kv-dtype {kv} is a CUDA engine option: the MLX path caches keys and values as bf16")
     supported = getattr(family.package, "CUDA_KV_DTYPES", ("bf16",))
-    if kv not in supported:
+    if kv is not None and kv not in supported:
         raise ValueError(f"{family.title} on CUDA serves a {' or '.join(supported)} KV cache, not --kv-dtype {kv}")
     slots = getattr(args, "checkpoint_slots", None)
     if slots is not None and backend == "cuda" and getattr(family.package, "CUDA_CHECKPOINT_SLOTS", False):

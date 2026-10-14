@@ -135,9 +135,10 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
                       help="with --tp 2/4: this machine's rank; rank 0 serves HTTP, others follow it")
     cuda.add_argument("--master", default="", help="with --tp 2/4: rank 0's address on the link between the ranks")
     cuda.add_argument("--master-port", type=int, default=29551, help="with --tp 2/4: rank 0's rendezvous port")
-    cuda.add_argument("--kv-dtype", choices=("bf16", "fp8", "int8", "int4"), default="bf16",
-                      help="KV cache: bf16 (default); fp8 E4M3FN + FP32 scale per row (full GLM MLA); "
-                           "int8/int4 + fp16 scale per 32 values (Flash Next). Quantization changes output")
+    cuda.add_argument("--kv-dtype", choices=("bf16", "fp8", "int8", "int4"), default=None,
+                      help="KV cache dtype. Unset: fp8 on full GLM-5.3 (E4M3FN codes, one FP32 scale a row), bf16 "
+                           "elsewhere. int8/int4 (fp16 scale per 32 values) are Flash Next's. Quantization "
+                           "changes the output, so an exactness claim is relative to the dtype in use")
     cuda.add_argument("--prefill-fp8", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                       help="prompt matmuls take FP8 (e4m3) activations, one scale a row, where the checkpoint has an "
                            "FP8 prompt kernel (Qwen3.8 27B and Qwen3.6 MLX 4-bit, NVFP4 checkpoints' FP8 and MXFP8 "

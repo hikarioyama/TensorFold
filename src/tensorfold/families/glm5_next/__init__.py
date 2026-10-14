@@ -240,7 +240,10 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
     """Build the multi-rank engine with MTP drafting, reusable prompt state, or serial decoding when drafts are off."""
 
     full = _is_full(model_dir)
-    kv_dtype = options.get("kv_dtype", "bf16")
+    # Full GLM-5.3 defaults to the fp8 latent cache. A row is read once a token either way, and fp8
+    # is what the cache costs: on four 95 GiB cards bf16 topped out at a 98K window and fp8 reaches
+    # 256K. Flash has no fp8 kernel and stays bf16. An explicit --kv-dtype always wins.
+    kv_dtype = options.get("kv_dtype") or ("fp8" if full else "bf16")
     if kv_dtype not in CUDA_KV_DTYPES or (kv_dtype != "bf16" and not full):
         raise ValueError("FP8 KV cache is supported only by full GLM-5.3, not Flash")
     if full:

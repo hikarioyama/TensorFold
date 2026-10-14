@@ -255,7 +255,7 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     drafter = "" if args.no_drafts else _drafter(family, args.drafter, "cuda")
     options: dict[str, Any] = {"drafter": drafter, "tp": int(args.tp), "rank": int(args.rank), "master": args.master,
                                "master_port": int(args.master_port), "no_drafts": bool(args.no_drafts)}
-    if getattr(args, "kv_dtype", "bf16") != "bf16":
+    if getattr(args, "kv_dtype", None) is not None:      # unset: the family's own default (fp8 on full GLM-5.3)
         options["kv_dtype"] = args.kv_dtype
     options.update(_vision_options(args))
     if args.mtp_drafts is not None:
