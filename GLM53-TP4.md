@@ -152,6 +152,24 @@ concurrent scaling.
 - Short completions are kept, not excluded: a 16K code input produced 8 IDs and
   a 32K code input 195 IDs, both including EOS.
 
+### 4.5 Fixed drafting depth (MTP-3)
+
+A separate round (2026-10-14, the same four Max-Q cards, one stream, fp8 KV,
+greedy, 256 tokens, MTP only, a cold prefill a sample, two samples a cell)
+compared a fixed depth. Every depth returned the same token IDs, so the depth is
+a rate choice, not a precision one.
+
+| Input | depth 1 | depth 2 | depth 3 |
+|---|---:|---:|---:|
+| 4K code, decode tok/s | 85.4 | 93.2 | **98.2** |
+| 4K code, tokens a round | 1.91 | 2.51 | 3.05 |
+| 4K code, drafts accepted | 86% | 76% | 68% |
+| 16K code, decode tok/s | 86.7 | 95.2 | **99.9** |
+
+Prefill is unchanged by the depth (661-678 prompt tok/s at 4K at either depth),
+and the gain flattens as acceptance falls: later drafts are spent, not wasted,
+but each one buys less. The reference server runs `--mtp-drafts 3`.
+
 ## 5. Correctness evidence
 
 - **Original token IDs are preserved.** Drafted output equals `"draft": false`
@@ -221,6 +239,9 @@ export TF_NUCLEUS_AMAX=1 TF_NUCLEUS_UNSORTED=1 TF_NUCLEUS_SINGLETON=1
 # half a bf16 row, which is what a wide window costs on four cards. Index keys stay FP16.
 #   --kv-dtype fp8     the default for full GLM-5.3
 #   --kv-dtype bf16    the unquantized cache (Flash serves this and nothing else)
+
+# Drafting. A fixed depth of 3 led 1 and 2 on this host at equal token IDs (4.5).
+#   --mtp-drafts 3     the reference server's drafting depth
 ```
 
 These are **experimental selectors**, left default-off or legacy-on in the code.
